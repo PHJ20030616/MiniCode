@@ -1,1 +1,2 @@
-"""Configuration loading and models."""
+"""MiniCode 配置系统。"""
+

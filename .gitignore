@@ -11,6 +11,11 @@ build/
 venv/
 env/
 
+# Testing
+.coverage
+htmlcov/
+.coverage.*
+
 # Project runtime data (sessions, memory, local config)
 .minicode/
 

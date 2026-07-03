@@ -5,6 +5,7 @@ from pathlib import Path
 import typer
 
 from minicode import __version__
+from minicode.config.loader import ConfigError, load
 
 app = typer.Typer(
     name="minicode",
@@ -20,7 +21,7 @@ def version_callback(value: bool) -> None:
         raise typer.Exit
 
 
-@app.callback()
+@app.callback(invoke_without_command=True)
 def main(
     version: bool = typer.Option(
         False,
@@ -58,6 +59,21 @@ def main(
     ),
 ) -> None:
     """运行 MiniCode，一个简化的 AI 辅助编程工具。"""
+    try:
+        cli_overrides: dict[str, str] = {}
+        if model is not None:
+            cli_overrides["model"] = model
+        if provider is not None:
+            cli_overrides["provider"] = provider
+
+        load(
+            config_path=config,
+            workspace=workspace,
+            cli_overrides=cli_overrides or None,
+        )
+    except ConfigError as e:
+        typer.echo(f"配置错误：{e}", err=True)
+        raise typer.Exit(code=1) from None
 
 
 if __name__ == "__main__":
