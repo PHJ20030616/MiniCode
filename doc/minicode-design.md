@@ -24,8 +24,8 @@
 │           │                              │               │
 │  ┌────────▼──────────┐    ┌──────────────▼─────────────┐ │
 │  │  Provider Adapter │    │     Tool Registry           │ │
-│  │  OpenAI兼容优先   │    │  read/write/grep/bash/...   │ │
-│  │  Anthropic 后续   │    │  权限检查器包装             │ │
+│  │  OpenAI兼容优先   │    │  read/grep/glob first       │ │
+│  │  Anthropic 后续   │    │  workspace 安全边界         │ │
 │  └───────────────────┘    └─────────────────────────────┘ │
 ├──────────────────────────────────────────────────────────┤
 │                    Storage Layer                          │
@@ -51,6 +51,18 @@
 | 日志 | structlog | 结构化日志，现代 Python 日志标准 |
 | 测试 | pytest + pytest-asyncio | 异步测试支持 |
 | 类型检查 | mypy | CI 集成，严格模式 |
+
+## 2.1 版本边界
+
+MiniCode 采用分阶段交付，避免在 MVP 阶段同时处理 Provider 适配、破坏性工具、权限、会话和记忆系统。
+
+| 版本 | 核心交付 | 暂不包含 |
+|------|----------|----------|
+| v0.1 | OpenAI-compatible 流式对话、只读工具、ReAct 主闭环 | 写文件、shell、会话、记忆、Anthropic |
+| v0.2 | 写入/编辑/shell 工具、参数级权限、会话持久化 | Anthropic、PyPI 发布 |
+| v0.3 | 斜杠命令、会话和配置查看命令 | 记忆、Provider 切换、Anthropic、复杂多模态 |
+| v0.4 | 记忆、多 OpenAI-compatible Provider 切换 | Anthropic、并行工具、PyPI 发布 |
+| v1.0 | CI、文档、错误处理、Anthropic、发布质量 | 新增大功能 |
 
 ## 3. 目录结构
 
@@ -95,7 +107,7 @@ MiniCode/
 │       │   ├── file_read.py          # 读取文件
 │       │   ├── file_write.py         # 写入文件
 │       │   ├── file_edit.py          # 精确字符串替换编辑
-│       │   ├── bash.py               # 执行 shell 命令
+│       │   ├── shell.py              # 执行平台默认 shell 命令（v0.2）
 │       │   ├── grep.py               # ripgrep 内容搜索
 │       │   └── glob.py               # 文件模式匹配
 │       │
@@ -150,7 +162,7 @@ MiniCode/
 │   │   ├── test_file_read.py
 │   │   ├── test_file_write.py
 │   │   ├── test_file_edit.py
-│   │   ├── test_bash.py
+│   │   ├── test_shell.py
 │   │   ├── test_grep.py
 │   │   └── test_glob.py
 │   ├── test_commands/
@@ -185,7 +197,7 @@ MiniCode/
 [判断响应类型]
   ├─ 纯文本 → 渲染输出，等待下一轮用户输入 ✓
   └─ 含 tool_calls → 进入工具执行流程:
-       ├─ 权限检查（checker.check(tool_name, args)）
+       ├─ 安全检查（workspace root / 敏感文件 / 权限）
        ├─ 需要确认？→ prompt_toolkit 弹确认框
        ├─ 执行工具 → ToolResult
        ├─ 追加 tool_result 到 messages
@@ -195,9 +207,10 @@ MiniCode/
 **关键设计点：**
 - 串行工具执行（MVP）：单轮多工具按顺序执行
 - 并行工具执行（后续优化）：无依赖的工具并行执行
-- 最大轮次限制：20 轮，防止无限循环
+- 最大轮次限制：v0.1 默认 8 轮，从配置读取，后续可配置到 20 轮
 - 用户中断：Ctrl+C 可中断当前 Agent Loop
 - 空消息处理：tool_calls 为空的异常情况
+- v0.1 优先保证工具调用正确性：文本回复保持流式，工具调用可先使用非流式响应或完整 tool_call 收集后执行
 
 ### 4.2 Provider 内部统一格式
 
@@ -225,6 +238,11 @@ class FunctionCall(BaseModel):
     name: str
     arguments: str  # JSON string
 ```
+
+**Provider 抽象约束：**
+- 内部模型可以采用 OpenAI-compatible 命名，但 Agent Loop 不应直接依赖 OpenAI SDK 返回对象。
+- `system`、普通消息、assistant tool call、tool result 必须能转换到 Anthropic 风格消息结构。
+- v0.1 不实现真实 Anthropic Provider，但必须用 mock contract test 验证上述转换可行，避免后续适配时大规模重构。
 
 ### 4.3 BaseProvider 抽象
 
@@ -290,30 +308,39 @@ class ReadFileTool(BaseTool):
     risk_level = "safe"
 ```
 
-**MVP 工具列表：**
+**工具分阶段列表：**
 
-| 工具 | 风险级别 | 功能 |
-|------|----------|------|
-| `read_file` | 🟢 safe | 读取文件，支持行范围、PDF/图片 |
-| `write_file` | 🟡 caution | 创建/覆盖文件 |
-| `edit_file` | 🟡 caution | 精确字符串替换（类似 Claude Code Edit） |
-| `bash` | 🔴 dangerous | 执行 shell 命令，可配置超时 |
-| `grep` | 🟢 safe | ripgrep 内容搜索，支持正则、多行、文件类型过滤 |
-| `glob` | 🟢 safe | 文件模式匹配 |
+| 工具 | 版本 | 风险级别 | 功能 |
+|------|------|----------|------|
+| `read_file` | v0.1 | 🟢 safe | 读取 workspace 内文本文件，支持行范围 |
+| `grep` | v0.1 | 🟢 safe | 搜索 workspace 内文本内容，优先 ripgrep，支持 Python fallback |
+| `glob` | v0.1 | 🟢 safe | 文件模式匹配 |
+| `write_file` | v0.2 | 🟡 caution | 创建/覆盖文件 |
+| `edit_file` | v0.2 | 🟡 caution | 精确字符串替换（类似 Claude Code Edit） |
+| `shell` | v0.2 | 🔴 dangerous | 按平台执行 shell 命令，可配置超时 |
+
+**默认安全边界：**
+- 所有文件工具默认只能访问当前 workspace root 内的路径。
+- `../` 逃逸路径、指向 workspace 外的绝对路径默认拒绝。
+- `.env`、SSH/Git 凭据、私钥、token 文件等敏感路径默认拒绝读取，即使是 safe 工具。
+- 工具输出必须截断，避免把过长文件或搜索结果直接塞满上下文。
+- PDF/图片读取不属于 v0.1，后续作为多模态扩展单独设计。
 
 ### 4.5 权限控制
 
 ```
-操作分级 + 授权记忆：
+操作分级 + 参数级判断 + 授权记忆：
 
-🟢 safe（读文件、搜索）→ 静默执行，不询问
-🟡 caution（写文件、编辑文件）→ 首次询问 [Y/n/always]，会话内记住
-🔴 dangerous（bash、删除）→ 每次都询问
+🟢 safe（读 workspace 内普通文件、搜索）→ 静默执行，不询问
+🟡 caution（写文件、编辑文件、覆盖已有文件）→ 询问 [Y/n/always]
+🔴 dangerous（shell、删除、批量破坏性操作）→ 每次询问
+⛔ deny（敏感文件、workspace 外路径、明显危险参数）→ 默认拒绝
 
 授权模式：
 - 默认模式：按上述分级询问
-- --trust 模式：跳过所有询问（全局信任标志）
-- 会话记忆：用户选择 "Always allow" → 写入权限 store
+- --trust 模式：跳过 caution/dangerous 的确认，但不绕过 deny
+- 会话记忆：用户选择 "Always allow" → 写入权限 store，按工具名和路径 pattern 匹配
+- v0.1 只实现安全检查和只读工具；完整权限确认交互在 v0.2 引入
 ```
 
 ### 4.6 斜杠命令系统
@@ -335,19 +362,18 @@ class BaseCommand(ABC):
     async def execute(self, args: str, ctx: CommandContext) -> CommandResult: ...
 ```
 
-**MVP 命令：**
+**斜杠命令分阶段：**
 
-| 命令 | 别名 | 功能 |
-|------|------|------|
-| `/new` | - | 创建新会话 |
-| `/session` | `/s` | 列表/切换/删除会话 |
-| `/model` | `/m` | 切换模型 |
-| `/provider` | `/p` | 切换服务提供商 |
-| `/clear` | `/c` | 清除当前对话上下文（保留 system prompt） |
-| `/memory` | `/mem` | 记忆增删查 |
-| `/config` | `/cfg` | 查看/修改当前配置 |
-| `/help` | `/h`, `/?` | 帮助信息 |
-| `/quit` | `/exit`, `/q` | 退出 |
+| 命令 | 版本 | 别名 | 功能 |
+|------|------|------|------|
+| `/quit` | v0.3 | `/exit`, `/q` | 退出 |
+| `/help` | v0.3 | `/h`, `/?` | 帮助信息 |
+| `/clear` | v0.3 | `/c` | 清除当前对话上下文 |
+| `/session` | v0.3 | `/s` | 列表/切换/删除会话 |
+| `/model` | v0.4 | `/m` | 切换模型 |
+| `/provider` | v0.4 | `/p` | 切换服务提供商 |
+| `/config` | v0.3 | `/cfg` | 查看配置 |
+| `/memory` | v0.4 | `/mem` | 记忆增删查 |
 
 ### 4.7 配置系统
 
@@ -407,6 +433,10 @@ class Session(BaseModel):
 name: user-preference
 description: 用户偏好 Python 使用 pytest 进行测试
 created: 2026-07-02T14:30:00
+updated: 2026-07-02T14:30:00
+source: user
+scope: global
+confidence: 0.8
 type: user
 ---
 
@@ -425,7 +455,12 @@ type: user
 └── ...
 ```
 
-**加载策略：** 每次会话启动时，读取所有 `.minicode/memory/*.md`（除 MEMORY.md），合并内容注入 system prompt。
+**加载策略：** v0.4 起，每次会话启动时读取 `.minicode/memory/*.md`（除 MEMORY.md），在总长度上限内合并后注入 system prompt。默认上限 8,000 字符，避免记忆污染上下文。
+
+**冲突与时效性：**
+- 每条记忆包含 `created_at`、`updated_at`、`source`、`scope`、`confidence`。
+- 注入时优先选择 scope 匹配当前 workspace、`updated_at` 较新、`confidence` 较高的记忆。
+- 同名或同 scope 记忆冲突时不自动删除旧记录，但 debug 日志应记录冲突和最终注入选择。
 
 ### 4.10 日志系统
 
@@ -454,7 +489,7 @@ type: user
                                ├─ → Provider.chat(messages, tools, stream=True)
                                ├─ → 流式渲染文本 delta
                                ├─ → 收集 tool_calls
-                               ├─ → 权限检查（需要确认？）
+                               ├─ → 安全/权限检查（需要确认？）
                                ├─ → 执行工具
                                ├─ → 追加 tool_result 到 messages
                                └─ → 循环直到文本响应
@@ -474,3 +509,15 @@ type: user
 | 包管理 | uv | 2024-2025 最火工具，极快 |
 | HTTP 客户端 | httpx | async 原生，SDK 底层依赖 |
 | 日志库 | structlog | 结构化，现代标准 |
+
+## 7. 测试策略
+
+| 测试类型 | 目标 | 开始版本 |
+|----------|------|----------|
+| 单元测试 | 验证配置、工具、权限、Provider 转换等独立模块 | v0.1 |
+| Provider contract test | 验证内部消息模型能映射到 OpenAI-compatible 和 Anthropic 风格 | v0.1 |
+| 关键路径集成测试 | 验证 Agent Loop + mock Provider + ToolRegistry + workspace 协作 | v0.1 |
+| 会话集成测试 | 验证 Agent Loop 后保存、加载、继续追加消息 | v0.2 |
+| 权限集成测试 | 验证权限拒绝/允许会影响实际工具执行 | v0.2 |
+| 命令集成测试 | 验证 slash command 改变会话、清空上下文、查看配置 | v0.3 |
+| Provider 切换集成测试 | 验证命令切换模型和 Provider 后下一轮对话使用新配置 | v0.4 |

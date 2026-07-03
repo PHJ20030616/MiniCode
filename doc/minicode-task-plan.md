@@ -1,574 +1,515 @@
 # MiniCode — 任务计划书
 
 > 从零构建一个简化版 Claude Code 的 Python CLI 工具，用于 AI 辅助编程。
-> 开源项目，面向求职简历，注重工程质量和架构设计。
+> 开源项目，面向求职简历，注重工程质量、可运行主线和清晰架构。
 >
 > **详细设计文档**：参见 `doc/minicode-design.md`
 
 ---
 
+## 执行策略
+
+这个计划按可交付版本拆分，而不是按“完整功能清单”一次性铺开。每个版本结束时都必须有一个可运行、可测试、可演示的产品。
+
+| 版本 | 目标 | 不做 |
+|------|------|------|
+| v0.1 | OpenAI-compatible 流式对话 + 只读工具 + ReAct 主闭环 | 写文件、执行 shell、记忆、多 Provider |
+| v0.2 | 写入/编辑/shell 工具 + 参数级权限 + 会话持久化 | Anthropic、复杂 TUI、发布 |
+| v0.3 | 斜杠命令和日常会话操作 | 记忆系统、Anthropic、发布 |
+| v0.4 | 记忆系统、Provider/Model 切换体验 | PyPI 正式发布 |
+| v1.0 | CI、文档、错误处理、开源发布质量 | 新增大功能 |
+
 ## 任务执行原则
 
-1. **先跑通主线，再优化细节** — 每个 Phase 结束时必须有一个可运行的产品
-2. **每个任务独立可测** — 有明确的验收标准
-3. **工具串行先于并行** — MVP 不追求极致性能
-4. **OpenAI 兼容优先** — 覆盖最大范围的用户（OpenAI + DeepSeek + 中转站）
-5. **测试跟随开发** — 每完成一个模块就写测试，不要最后补
+1. **主线优先**：先让“用户提问 -> 模型读项目文件 -> 回答”稳定跑通。
+2. **MVP 边界硬化**：v0.1 只做只读工具，避免权限和破坏性操作拖慢主线。
+3. **测试跟随开发**：每个 Phase 都有自己的测试 gate，不把质量集中推迟到最后。
+4. **Provider 简化**：v0.1 只支持 OpenAI-compatible API，工具调用可以先非流式，文本回复保持流式。
+5. **安全默认值**：所有文件工具默认限制在 workspace root 内，敏感文件默认拒绝读取。
+6. **手动验收不可替代单测**：手动测试只验证真实体验，核心逻辑必须有自动化测试。
 
 ---
 
-## Phase 0：项目初始化与基础设施
+## v0.1：只读 Agent MVP
 
-> **目标：** 一个可以运行 `minicode` 命令的骨架项目，目录结构就位，依赖安装完毕。
+> **目标：** 启动 `minicode` 后，用户可以和模型流式对话；模型可以读取/搜索当前项目文件并回答问题。
 
-### Task 0.1 — 初始化项目结构
+### Phase 0：项目初始化与基础设施
+
+#### Task 0.1 — 初始化项目结构
 
 **要求：**
-- 使用 `uv init` 初始化项目
-- 配置 `pyproject.toml`（项目元信息、Python 3.12+、依赖声明）
-- 创建完整的 `src/minicode/` 目录结构（所有包的 `__init__.py`）
-- 创建 `tests/` 目录结构
-- 创建 `.gitignore`（Python 模板 + `.minicode/`）
+- 使用 `uv` 创建 Python 3.12+ 项目。
+- 采用 `src/minicode/` 包结构。
+- 创建测试目录和基础配置文件。
+- `.gitignore` 忽略 `.minicode/`、虚拟环境、缓存、日志。
 
-**推荐实现：**
+**推荐依赖：**
 ```bash
-uv init MiniCode
-cd MiniCode
-uv add rich prompt-toolkit httpx pydantic structlog pyyaml typer
-uv add --dev pytest pytest-asyncio pytest-mock mypy ruff
+uv init --package MiniCode
+uv add rich prompt-toolkit openai httpx pydantic structlog pyyaml typer
+uv add --dev pytest pytest-asyncio pytest-mock pytest-cov mypy ruff
 ```
 
-**验收标准：** `uv run python -c "import minicode"` 不报错
-
----
-
-### Task 0.2 — CLI 入口与参数解析
-
-**要求：**
-- 使用 Typer 实现 CLI 入口 `minicode/main.py`
-- 支持以下命令行参数：
-  - `--model` / `-m`：指定模型
-  - `--provider` / `-p`：指定 Provider
-  - `--session` / `-s`：恢复指定会话
-  - `--trust`：跳过权限确认
-  - `--verbose` / `-v`：详细日志
-  - `--debug`：调试日志
-  - `--version`：显示版本
-  - `--list-sessions`：列出历史会话
-- 入口函数解析参数后，调用 `cli/app.py` 的 `run()` 函数
-
-**关键文件：** `src/minicode/main.py`
-
-**验收标准：** `uv run minicode --version` 输出版本信息
-
----
-
-### Task 0.3 — 配置系统
-
-**要求：**
-- 实现 `config/loader.py`：多层配置加载
-  - 从 `~/.minicode/config.yaml` 读取全局配置
-  - 从 `./.minicode/config.yaml` 读取项目配置
-  - 合并环境变量（`MINICODE_*`）
-  - 命令行参数覆盖
-- 实现 `config/models.py`：Pydantic 配置模型
-  - `MinicodeConfig`：顶层配置
-  - `ProviderConfig`：单个 Provider 配置（api_key, base_url, models）
-  - `ModelConfig`：模型默认设置
-  - `AgentConfig`：Agent 行为配置
-- 支持环境变量占位符：`api_key: "${ENV_VAR_NAME}"`
-
-**关键文件：** `src/minicode/config/loader.py`, `src/minicode/config/models.py`
-
-**验收标准：** 单元测试覆盖所有加载优先级场景
-
----
-
-### Task 0.4 — 日志系统
-
-**要求：**
-- 实现 `utils/logger.py`：structlog 配置
-  - 控制台输出：Rich 渲染，彩色
-  - 文件输出：JSON 格式，按天轮转
-  - 支持 `--verbose` 和 `--debug` 标志
-- 实现 `utils/exceptions.py`：基础异常类
-  - `MiniCodeError`（基类）
-  - `ConfigError`
-  - `ProviderError`
-  - `ToolError`
-
-**关键文件：** `src/minicode/utils/logger.py`, `src/minicode/utils/exceptions.py`
-
-**验收标准：** 运行程序，日志正确写入文件和控制台
-
----
-
-## Phase 1：首次对话（无工具的单轮对话）
-
-> **目标：** 用户输入问题 → 调用 LLM → 流式显示回复。这是整个系统的"心跳"。
-
-### Task 1.1 — Provider 抽象与注册
-
-**要求：**
-- 实现 `providers/base.py`：
-  - `BaseProvider` 抽象类（`chat()`, `list_models()`）
-  - `StreamChunk` 数据模型（`text_delta | tool_call_delta | done | error`）
-- 实现 `providers/registry.py`：
-  - `ProviderRegistry`：字典注册 Provider 实例
-  - 支持 `get(name)` 和 `register(name, provider)`
-- 统一内部消息格式：`Message`, `ToolCall`, `FunctionCall`（Pydantic 模型）
-
-**关键文件：** `src/minicode/providers/base.py`, `src/minicode/providers/registry.py`
-
-**验收标准：** Provider Registry 可以注册和获取 Provider
-
----
-
-### Task 1.2 — OpenAI 兼容 Provider
-
-**要求：**
-- 实现 `providers/openai_compatible.py`：
-  - 继承 `BaseProvider`
-  - 支持流式 SSE 解析
-  - 正确处理 `text_delta` 和 `tool_call_delta` 两种 chunk
-  - 支持用户自定义 `base_url` 和 `api_key`（中转站场景）
-- 支持以下 API 端：OpenAI、DeepSeek、任意 OpenAI 兼容中转站
-
-> **建议：** MVP 阶段直接用 `openai` 官方库（`openai.AsyncOpenAI`），它已经处理好了 SSE 流解析，可以少踩坑。后续如果需要更灵活的控制，再切换为 httpx 手动解析。
-
-**关键文件：** `src/minicode/providers/openai_compatible.py`
+**关键文件：**
+- `pyproject.toml`
+- `src/minicode/__init__.py`
+- `src/minicode/main.py`
+- `tests/conftest.py`
 
 **验收标准：**
-1. 单元测试（mock HTTP）验证流式解析正确
-2. 手动测试：用 DeepSeek API 发一条消息，看到流式回复
+- `uv run python -c "import minicode"` 不报错。
+- `uv run pytest` 可以启动并通过空测试或 smoke test。
 
----
-
-### Task 1.3 — CLI 终端渲染器
+#### Task 0.2 — CLI 入口与最小参数解析
 
 **要求：**
-- 实现 `cli/renderer.py`：
-  - 使用 Rich 渲染 Markdown 文本（`Markdown` 组件）
-  - 代码块语法高亮（`Syntax` 组件）
-  - 流式追加文本（`Live` 组件实时刷新）
-- 实现 `cli/theme.py`：
-  - 定义颜色/样式常量
-  - 统一的视觉风格
-
-**关键文件：** `src/minicode/cli/renderer.py`, `src/minicode/cli/theme.py`
-
-**验收标准：** 渲染一段包含代码块的 Markdown 文本，显示正确
-
----
-
-### Task 1.4 — 单轮对话主循环（MVP 核心）
-
-**要求：**
-- 实现 `cli/app.py`：
-  - 使用 `prompt_toolkit` 异步模式接收用户输入
-  - 调用 Provider 的流式 chat 接口
-  - 实时渲染回复
-  - 无工具调用（Phase 1 只做纯文本）
-- 实现 `agent/system_prompt.py`：
-  - 构建基本的 system prompt（告诉模型它的角色和能力）
-- 整个链路跑通：用户输入 → API 调用 → 流式渲染 → 等待下一次输入
-
-**关键文件：** `src/minicode/cli/app.py`, `src/minicode/agent/system_prompt.py`
-
-**验收标准：** 启动 `minicode`，输入 "Hello"，看到流式回复
-
----
-
-## Phase 2：核心闭环 — 工具调用 + Agent Loop
-
-> **目标：** 模型可以调用工具（读文件、写文件、搜索、执行命令），形成完整的 ReAct 循环。
-
-### Task 2.1 — 工具系统基础设施
-
-**要求：**
-- 实现 `tools/base.py`：
-  - `BaseTool` 抽象类（name, description, parameters, risk_level, execute）
-  - `ToolResult` 数据模型
-- 实现 `tools/registry.py`：
-  - `ToolRegistry`：装饰器注册 + 字典存储
-  - `get_all_tools()`, `get_tool(name)`, `get_tools_schema()`（生成 OpenAI 兼容的 tools 数组）
-- 工具 `parameters` 字段使用 JSON Schema 格式，可直接传给 API
-
-**关键文件：** `src/minicode/tools/base.py`, `src/minicode/tools/registry.py`
-
-**验收标准：** 注册多个工具，`get_tools_schema()` 输出正确的 JSON Schema 数组
-
----
-
-### Task 2.2 — 文件读取工具
-
-**要求：**
-- 实现 `tools/file_read.py`：
-  - 支持指定行范围（`offset`, `limit`）
-  - 支持 PDF 文件（`pages` 参数，可选）
-  - 支持图片文件（可选）
-  - 目录读取返回错误提示
-  - 文件不存在返回友好错误
-
-> **建议：** 第一版先支持文本文件，PDF/图片作为第二版
-
-**关键文件：** `src/minicode/tools/file_read.py`
-
-**验收标准：** 单元测试：读文本文件、读不存在的文件、读目录、读行范围
-
----
-
-### Task 2.3 — 文件写入工具
-
-**要求：**
-- 实现 `tools/file_write.py`：
-  - 创建新文件或覆盖已有文件
-  - 父目录不存在 → 自动创建
-
-**关键文件：** `src/minicode/tools/file_write.py`
-
-**验收标准：** 单元测试覆盖各种场景
-
----
-
-### Task 2.4 — 文件编辑工具
-
-**要求：**
-- 实现 `tools/file_edit.py`：
-  - **精确字符串替换**（类似 Claude Code 的 Edit 工具）
-  - 参数：`file_path`, `old_string`, `new_string`, `replace_all`
-  - `old_string` 必须在文件中唯一（`replace_all=false` 时），否则报错
-  - 实施前验证：确认文件存在、old_string 匹配、唯一性检查
-
-**关键文件：** `src/minicode/tools/file_edit.py`
-
-**验收标准：** 单元测试：单次替换、全部替换、不唯一报错、不匹配报错
-
----
-
-### Task 2.5 — Bash 执行工具
-
-**要求：**
-- 实现 `tools/bash.py`：
-  - 使用 `asyncio.create_subprocess_shell` 执行命令
-  - 支持 `timeout` 参数（默认 120 秒，最大 600 秒）
-  - 返回：stdout, stderr, exit_code
-  - 截断超长输出（避免 token 消耗过大）
-  - 注意：Windows 兼容（git bash / WSL / cmd 的差异）
-
-**关键文件：** `src/minicode/tools/bash.py`
-
-**验收标准：** 单元测试：执行简单命令、超时、错误命令
-
----
-
-### Task 2.6 — 代码搜索工具
-
-**要求：**
-- 实现 `tools/grep.py`：
-  - 底层调用 ripgrep（`rg`），如果不可用则 fallback 到 Python 实现
-  - 参数：`pattern`（正则）、`path`、`glob`（文件类型过滤）、`-A/-B/-C`（上下文行数）
-  - `output_mode`：`content` / `files_with_matches` / `count`
-  - `head_limit`：限制输出行数（默认 250）
-  - `multiline`：多行模式（`rg -U --multiline-dotall`）
-- 实现 `tools/glob.py`：
-  - 文件模式匹配（`**/*.py`, `src/**/*.ts`）
-  - 返回匹配路径列表，按修改时间排序
-
-> **建议：** ripgrep 检测用 `shutil.which("rg")`，如果存在则 subprocess 调用；否则用 `pathlib.Path.rglob` + `re` 作为 fallback
-
-**关键文件：** `src/minicode/tools/grep.py`, `src/minicode/tools/glob.py`
-
-**验收标准：** 单元测试：grep 搜索、glob 匹配、多行模式、fallback
-
----
-
-### Task 2.7 — 权限控制系统
-
-**要求：**
-- 实现 `permissions/checker.py`：
-  - `check(tool: BaseTool, args: dict) -> PermissionDecision`
-  - 三级判定：🟢safe → 允许 / 🟡caution → 会话内首次询问 / 🔴dangerous → 每次询问
-  - 支持 `--trust` 全局跳过
-- 实现 `permissions/store.py`：
-  - 记录用户的 "Always allow" 决定
-  - 存储位置：`.minicode/permissions.json`
-- prompt_toolkit 确认框集成：
-  - 工具执行前弹出确认：[Y] 允许 / [n] 拒绝 / [a] 总是允许
-
-**关键文件：** `src/minicode/permissions/checker.py`, `src/minicode/permissions/store.py`
-
-**验收标准：** 单元测试覆盖各种权限场景
-
----
-
-### Task 2.8 — ReAct Agent Loop
-
-**要求：**
-- 实现 `agent/loop.py`：
-  - 完整的 ReAct 循环：构建 messages → 调用 Provider → 流式渲染/收集 tool_calls → 权限检查 → 执行工具 → 追加结果 → 循环
-  - 最大轮次限制（20 轮）
-  - 用户中断支持（Ctrl+C / Esc）
-  - 工具执行中显示状态："⏳ Executing read_file..."
-- 实现 `agent/context.py`：
-  - 简单的 token 估算（规则：约 4 字符 ≈ 1 token）
-  - 上下文窗口接近上限时发出警告
-
-**关键文件：** `src/minicode/agent/loop.py`, `src/minicode/agent/context.py`
+- 使用 Typer 实现 `minicode/main.py`。
+- v0.1 支持参数：
+  - `--model` / `-m`
+  - `--provider` / `-p`
+  - `--config`
+  - `--workspace`
+  - `--debug`
+  - `--version`
+- 暂不实现 `--session`、`--trust`、`--list-sessions`，这些进入 v0.2/v0.3。
 
 **验收标准：**
-1. 手动测试：要求模型 "读取 README.md 并总结内容"
-2. 手动测试：要求模型 "创建一个 hello.py 文件，内容是 print('hello')"
-3. 验证权限弹框出现，选择后工具执行
+- `uv run minicode --version` 输出版本信息。
+- `uv run minicode --help` 能看到参数说明。
 
----
-
-## Phase 3：用户体验完善
-
-> **目标：** 会话持久化、记忆系统、斜杠命令——让 MiniCode 成为一个"可以日常使用"的工具。
-
-### Task 3.1 — 会话管理
+#### Task 0.3 — 配置系统
 
 **要求：**
-- 实现 `session/models.py`：
-  - `Session` Pydantic 模型（id, name, messages, created_at, updated_at, model, provider）
-  - 每条 message 完整序列化（含 tool_calls, tool_call_id 等）
-- 实现 `session/manager.py`：
-  - `create_session()` → 新建会话
-  - `save_session(session)` → 保存到 `.minicode/sessions/<id>.json`
-  - `load_session(session_id)` → 从 JSON 恢复
-  - `list_sessions()` → 读取 `index.json`
-  - `delete_session(session_id)` → 删除文件
-  - `get_current_session()` → 返回当前活跃会话
-- **自动保存**：每次 Agent Loop 完成后自动保存
+- 实现多层配置加载：
+  1. 代码默认值
+  2. `~/.minicode/config.yaml`
+  3. `./.minicode/config.yaml`
+  4. 环境变量
+  5. CLI 参数
+- 支持 `${ENV_VAR}` 占位符解析。
+- v0.1 只要求 OpenAI-compatible Provider 配置。
 
-**关键文件：** `src/minicode/session/models.py`, `src/minicode/session/manager.py`
-
-**验收标准：** 单元测试覆盖 CRUD 全流程
-
----
-
-### Task 3.2 — 斜杠命令系统
-
-**要求：**
-- 实现 `commands/base.py`：
-  - `BaseCommand` 抽象类
-  - `CommandResult` 数据模型
-  - `CommandContext`（传入当前 session、config、provider registry）
-- 实现 `commands/registry.py`：
-  - `CommandRegistry`：装饰器注册
-  - `route(input: str) -> Command | None`：解析 `/xxx args` 格式
-- 实现以下命令（按优先级）：
-  1. `/quit` / `/exit` / `/q` — 退出
-  2. `/help` / `/h` — 帮助
-  3. `/new` — 新建会话
-  4. `/session` / `/s` — 会话管理（列表/切换/删除）
-  5. `/model` / `/m` — 切换模型
-  6. `/provider` / `/p` — 切换 Provider
-  7. `/clear` / `/c` — 清除上下文
-  8. `/config` / `/cfg` — 查看/修改配置
-  9. `/memory` / `/mem` — 记忆管理
-- 集成到 `cli/app.py`：用户输入以 `/` 开头 → 路由到命令；否则 → Agent Loop
-
-**关键文件：** `src/minicode/commands/`
+**关键文件：**
+- `src/minicode/config/models.py`
+- `src/minicode/config/loader.py`
+- `tests/test_config/test_loader.py`
 
 **验收标准：**
-1. 输入 `/help` 看到命令列表
-2. 输入 `/new` 创建新会话
-3. 输入 `/model gpt-4o` 切换模型，下次对话使用新模型
+- 单元测试覆盖默认配置、全局配置、项目配置、环境变量、CLI 覆盖优先级。
+- 缺少 API key 时给出清晰错误，不进入 Agent Loop。
 
----
-
-### Task 3.3 — 记忆系统
+#### Task 0.4 — 日志与异常
 
 **要求：**
-- 实现 `memory/models.py`：
-  - `Memory` Pydantic 模型（name, description, content, type, created_at）
-  - frontmatter 解析（YAML 格式的 `---` 包裹元数据）
-- 实现 `memory/manager.py`：
-  - `list_memories()` → 读取 `MEMORY.md` 索引
-  - `add_memory(memory)` → 创建新 `.md` 文件 + 更新索引
-  - `delete_memory(name)` → 删除文件 + 更新索引
-  - `get_all_content()` → 合并所有记忆内容（注入 system prompt）
-- 集成到 `agent/system_prompt.py`：
-  - 每次构建 system prompt 时，追加记忆内容
-- `/memory` 命令集成（add/list/delete）
-
-**关键文件：** `src/minicode/memory/models.py`, `src/minicode/memory/manager.py`
+- 实现基础异常类：`MiniCodeError`、`ConfigError`、`ProviderError`、`ToolError`。
+- 控制台默认只显示用户需要的信息。
+- `--debug` 时将结构化日志写入 `.minicode/logs/`。
 
 **验收标准：**
-1. 单元测试覆盖 CRUD
-2. 手动测试：`/memory add "我喜欢用 pytest"` → 新会话中模型提到测试时自动推荐 pytest
+- 配置错误不会打印长 traceback。
+- debug 模式下日志文件包含 provider、model、workspace、错误类型。
 
 ---
 
-### Task 3.4 — CLI 终端体验打磨
+### Phase 1：流式文本对话
+
+#### Task 1.1 — Provider 抽象
 
 **要求：**
-- 多行输入支持（`prompt_toolkit` 配置）
-- 输入历史（上下箭头浏览）
-- 语法感知的补全（`/` 开头补全命令名，普通补全文件路径）
-- 状态栏显示：当前模型、会话名、token 用量
-- 颜色/图标体系完善（`cli/theme.py`）
+- 定义内部消息模型：`Message`、`ToolCall`、`FunctionCall`、`ToolMessage`。
+- 定义 `BaseProvider`。
+- `chat()` 支持 `tools=None` 的纯文本流式对话。
+- v0.1 允许工具调用阶段使用非流式响应，降低增量 tool_call 解析复杂度。
+- 做一次 Anthropic 格式适配可行性验证：不实现真实 Anthropic Provider，只写 mock 转换测试，确认内部模型没有强依赖 OpenAI 独有字段。
 
-**关键文件：** `src/minicode/cli/input.py`, `src/minicode/cli/theme.py`
-
-**验收标准：** 手动体验：输入流畅，视觉美观，状态信息清晰
-
----
-
-## Phase 4：多 Provider 支持
-
-> **目标：** 支持 Anthropic API + 用户自定义中转站，覆盖主流 LLM 服务。
-
-### Task 4.1 — Anthropic Provider 适配器
-
-**要求：**
-- 实现 `providers/anthropic.py`：
-  - 将内部统一格式（OpenAI 兼容 messages + tools）**翻译为** Anthropic API 格式
-  - System prompt → 独立的 `system` 参数
-  - Messages → Anthropic 的 `messages` 数组
-  - Tools → Anthropic 的 `tools` 数组
-  - 流式解析 Anthropic 的 SSE 事件（`content_block_start/delta/stop`）
-  - 将 Anthropic 响应 **翻译回** 内部统一格式
-- 使用 `anthropic` 官方 Python SDK（`anthropic.AsyncAnthropic`）
-
-**关键文件：** `src/minicode/providers/anthropic.py`
+**关键文件：**
+- `src/minicode/providers/base.py`
+- `src/minicode/providers/registry.py`
+- `tests/test_providers/test_registry.py`
+- `tests/test_providers/test_message_contract.py`
 
 **验收标准：**
-1. 单元测试验证格式翻译正确（OpenAI ↔ Anthropic 互转）
-2. 手动测试：用 Claude API 完成一次带工具调用的对话
+- mock provider 可以注册、获取、返回文本 chunk。
+- 类型模型能序列化/反序列化普通 user/assistant/tool 消息。
+- mock Anthropic 转换测试能覆盖 system prompt、普通消息、assistant tool call、tool result 四类结构。
 
----
-
-### Task 4.2 — 自定义中转站 Provider
-
-**要求：**
-- 增强 `providers/openai_compatible.py`：
-  - 支持用户运行时通过 `/provider add custom <name> <base_url> <api_key>` 动态添加
-  - 动态 Provider 自动探测可用模型（调用 `/v1/models` 端点）
-- 配置持久化：新添加的 Provider 自动保存到 `~/.minicode/config.yaml`
-
-**关键文件：** `src/minicode/providers/openai_compatible.py`, `src/minicode/commands/provider_cmd.py`
-
-**验收标准：** 手动测试：添加一个中转站 → 切换 → 成功对话
-
----
-
-### Task 4.3 — 多 Provider 切换体验
+#### Task 1.2 — OpenAI-compatible Provider
 
 **要求：**
-- `/provider list` — 列出所有已配置的 Provider，高亮当前
-- `/provider switch <name>` — 切换
-- `/model list` — 列出当前 Provider 的可用模型
-- `/model switch <name>` — 切换模型
+- 使用 `openai.AsyncOpenAI` 实现 OpenAI-compatible API。
+- 支持 `api_key`、`base_url`、`model`。
+- 文本输出使用流式。
+- 网络超时、401、429、5xx 转换为友好错误。
 
-**验收标准：** 手动体验：流畅切换 Provider 和 Model
+**关键文件：**
+- `src/minicode/providers/openai_compatible.py`
+- `tests/test_providers/test_openai_compatible.py`
 
----
+**验收标准：**
+- 单元测试用 mock client 验证文本 delta 被正确转换为内部 chunk。
+- 手动测试可使用 OpenAI、DeepSeek 或兼容中转站完成一次纯文本对话。
 
-## Phase 5：质量打磨与开源准备
-
-> **目标：** 测试覆盖率、CI/CD、文档、错误处理——达到开源项目标准。
-
-### Task 5.1 — 完整测试套件
-
-**要求：**
-- 核心模块单元测试覆盖率 ≥ 80%
-- 重点测试：
-  - Agent Loop（mock Provider，验证 ReAct 循环逻辑）
-  - 工具执行（真实文件系统操作，用 tmp_path）
-  - Provider 格式翻译（OpenAI ↔ Anthropic 互转）
-  - 配置加载优先级
-  - 权限判断逻辑
-  - 会话序列化/反序列化
-- pytest fixtures：`mock_provider`, `tmp_session_dir`, `sample_config`
-
-**关键文件：** `tests/`, `tests/conftest.py`
-
-**验收标准：** `pytest --cov=src/minicode --cov-report=term` 覆盖率 ≥ 80%
-
----
-
-### Task 5.2 — CI/CD
+#### Task 1.3 — CLI 输入与渲染
 
 **要求：**
-- GitHub Actions workflow（`.github/workflows/ci.yml`）：
-  - Python 3.12 环境
-  - uv 安装依赖
-  - ruff 代码风格检查
-  - mypy 类型检查（严格模式）
-  - pytest 测试套件
-  - 覆盖率报告
+- 使用 `prompt_toolkit` 接收单行输入。
+- 使用 Rich 渲染 Markdown 和代码块。
+- v0.1 不要求复杂多行编辑、状态栏、补全。
 
-**验收标准：** push 到 GitHub 后 CI 自动运行，全部通过
+**关键文件：**
+- `src/minicode/cli/app.py`
+- `src/minicode/cli/renderer.py`
+- `src/minicode/cli/theme.py`
+
+**验收标准：**
+- 启动 `minicode`，输入 `Hello`，看到模型流式回复。
+- 输入 `exit` 或 Ctrl+C 能优雅退出。
 
 ---
 
-### Task 5.3 — 代码质量
+### Phase 2：只读工具与 ReAct 闭环
+
+#### Task 2.1 — 工具基础设施
 
 **要求：**
-- 配置 `ruff`：pyproject.toml 中定义规则（推荐 `select = ["E", "F", "I", "N", "W", "UP"]`）
-- 配置 `mypy`：`strict = true`
-- 所有 `async def` 有返回值类型注解
-- 所有公开 API 有 docstring
-- `__init__.py` 导出规范（控制公共 API 面）
+- 实现 `BaseTool`、`ToolResult`、`ToolRegistry`。
+- 工具 schema 输出兼容 OpenAI function tools。
+- 所有工具接收 `workspace_root`，默认禁止访问 workspace 外路径。
 
-**验收标准：** `ruff check` 和 `mypy src/minicode` 零错误
+**关键文件：**
+- `src/minicode/tools/base.py`
+- `src/minicode/tools/registry.py`
+- `src/minicode/tools/path_safety.py`
+- `tests/test_tools/test_registry.py`
+- `tests/test_tools/test_path_safety.py`
 
----
+**验收标准：**
+- `get_tools_schema()` 输出可直接传给 OpenAI-compatible API。
+- 路径 `../outside.txt`、绝对路径指向 workspace 外时被拒绝。
+- `.env`、`.ssh`、常见密钥文件默认拒绝读取。
 
-### Task 5.4 — 错误处理
-
-**要求：**
-- 网络错误（API 超时、连接失败）→ 自动重试（最多 3 次，指数退避），给用户友好提示
-- API 错误（401、429、500）→ 显示具体错误信息，不崩溃
-- 工具执行错误 → 返回 error 信息给 LLM（让模型知道操作失败了）
-- 全局异常捕获 → 记录日志，优雅退出
-
-**验收标准：** 手动测试：断网时不会崩溃，显示 "Network error, retrying..."
-
----
-
-### Task 5.5 — 文档编写
+#### Task 2.2 — 文本文件读取工具
 
 **要求：**
-- `README.md`：项目介绍、安装指南、快速开始、功能列表、配置说明、开发指南、许可证
-- `CONTRIBUTING.md`：贡献指南
-- `CHANGELOG.md`：版本变更记录
+- 实现 `read_file`。
+- 支持 `file_path`、`offset`、`limit`。
+- 只支持文本文件；PDF/图片进入后续版本。
+- 输出做长度截断，默认最多 20,000 字符。
 
----
+**关键文件：**
+- `src/minicode/tools/file_read.py`
+- `tests/test_tools/test_file_read.py`
 
-### Task 5.6 — 发布准备
+**验收标准：**
+- 覆盖成功读取、不存在、目录、越界行范围、超长截断、敏感文件拒绝。
+
+#### Task 2.3 — 搜索与文件匹配工具
 
 **要求：**
-- 配置 PyPI 发布（`pyproject.toml` 中的 `[project]` 完整元信息）
-- 打 Git tag（`v0.1.0`）
-- GitHub Release 页面
+- 实现 `glob`：支持 `**/*.py` 这类模式，按路径排序。
+- 实现 `grep`：优先调用 `rg`，不可用时 fallback 到 Python `re` + `Path.rglob`。
+- v0.1 不实现多行 grep，只支持常规单行匹配。
+- 输出默认最多 250 行。
+
+**关键文件：**
+- `src/minicode/tools/glob.py`
+- `src/minicode/tools/grep.py`
+- `tests/test_tools/test_glob.py`
+- `tests/test_tools/test_grep.py`
+
+**验收标准：**
+- 有 `rg` 和无 `rg` 两种路径均有测试。
+- 搜索不会越出 workspace。
+- 输出过长时明确说明已截断。
+
+#### Task 2.4 — ReAct Agent Loop
+
+**要求：**
+- 构建 `system + history + user` messages。
+- 调用 provider，允许模型返回 tool calls。
+- 串行执行工具。
+- 将工具结果追加为 tool message 后继续调用模型。
+- 最大轮次默认 8，超过后停止并提示用户。
+- 最大轮次从配置读取，默认 8；后续用户可通过配置文件调整。
+- v0.1 工具调用阶段可以不做流式 tool_call delta；优先正确性。
+
+**关键文件：**
+- `src/minicode/agent/loop.py`
+- `src/minicode/agent/system_prompt.py`
+- `src/minicode/agent/context.py`
+- `tests/test_agent/test_loop.py`
+
+**验收标准：**
+- mock provider 测试覆盖：无工具直接回答、一次 read_file 后回答、多工具串行、工具错误返回给模型、超过最大轮次。
+- 集成测试覆盖：Agent Loop + mock Provider + ToolRegistry + 临时 workspace 完成一次“读取文件后总结”的完整链路。
+- 手动测试：要求模型“读取 README.md 并总结内容”，能完成。
+
+#### v0.1 发布 Gate
+
+必须全部满足：
+- `uv run ruff check .` 通过。
+- `uv run mypy src/minicode` 通过，允许在 pyproject 中先采用适度严格配置，不强行 `strict = true`。
+- `uv run pytest --cov=src/minicode --cov-report=term` 覆盖率不低于 60%。
+- 至少 1 个关键路径集成测试通过：Agent Loop + mock Provider + 只读工具。
+- README 包含安装、配置、v0.1 功能和限制。
+- 提交 `uv.lock`，保证依赖可复现。
 
 ---
 
-## 附录 A：技术亮点清单（简历素材）
+## v0.2：写入能力、权限与会话
 
-| 亮点 | 说明 |
-|------|------|
-| 全异步架构 | asyncio + httpx，全链路非阻塞 |
-| 插件式工具系统 | 装饰器注册，零耦合，可扩展 |
-| 多 Provider 适配 | 内部统一格式 + 外部适配器，支持 OpenAI/Anthropic/自定义中转站 |
-| ReAct Agent Loop | 模型自主调用工具，多轮推理循环 |
-| 流式 SSE 解析 | 实时逐 token 渲染 |
-| 结构化日志 | structlog JSON 格式，可观测性 |
-| 多层配置合并 | CLI > ENV > 项目 > 全局 > 默认 |
-| 类型安全 | Pydantic v2 + mypy strict |
-| 文件级记忆系统 | Markdown + frontmatter，Git 友好 |
-| 三级权限控制 | safe / caution / dangerous 分级授权 |
+> **目标：** MiniCode 可以安全地修改项目文件，并能保存/恢复会话。
 
-## 附录 B：风险与缓解
+### Phase 3：参数级权限系统
+
+#### Task 3.1 — 权限模型
+
+**要求：**
+- 权限判断不只看工具名，还要看参数。
+- 判断维度：
+  - 路径是否在 workspace 内
+  - 是否覆盖已有文件
+  - 是否访问敏感文件
+  - 是否删除或批量修改
+  - shell 命令是否包含明显危险操作
+- `--trust` 在 v0.2 引入，但仍不允许默认读取敏感文件。
+
+**关键文件：**
+- `src/minicode/permissions/checker.py`
+- `src/minicode/permissions/models.py`
+- `tests/test_permissions/test_checker.py`
+
+**验收标准：**
+- 单测覆盖 safe/caution/dangerous/deny 四类结果。
+- 权限提示中包含工具名、目标路径、操作摘要。
+
+#### Task 3.2 — 权限确认交互
+
+**要求：**
+- 工具执行前需要确认时，支持 `[y] allow`、`[n] deny`、`[a] always allow this pattern`。
+- always allow 存储在 `.minicode/permissions.json`。
+- 存储项必须包含工具名、路径 pattern、创建时间。
+
+**关键文件：**
+- `src/minicode/permissions/store.py`
+- `src/minicode/cli/confirm.py`
+- `tests/test_permissions/test_store.py`
+
+**验收标准：**
+- 拒绝后工具不会执行，并将拒绝结果返回给模型。
+- always allow 只匹配同一工具和同一安全路径范围。
+
+### Phase 4：写入、编辑与 shell 工具
+
+#### Task 4.1 — 写文件工具
+
+**要求：**
+- 实现 `write_file`。
+- 支持创建文件、覆盖文件、自动创建父目录。
+- 覆盖已有文件必须触发权限确认。
+
+**验收标准：**
+- 测试覆盖新建、覆盖、父目录创建、workspace 外拒绝、敏感路径拒绝。
+
+#### Task 4.2 — 精确编辑工具
+
+**要求：**
+- 实现 `edit_file`。
+- 参数：`file_path`、`old_string`、`new_string`、`replace_all`。
+- `replace_all=false` 时 `old_string` 必须唯一。
+- 编辑前后返回简短 diff 摘要。
+
+**验收标准：**
+- 测试覆盖单次替换、全部替换、不匹配、不唯一、编码处理。
+
+#### Task 4.3 — Shell 工具
+
+**要求：**
+- 工具名使用 `shell`，不要承诺某一种 bash 环境。
+- Windows 下默认使用 PowerShell，Unix 下默认使用系统 shell。
+- 支持 timeout，默认 120 秒，最大 600 秒。
+- 超时后终止进程并返回 stdout/stderr 截断结果。
+- 危险命令每次确认。
+- 建立跨平台命令兼容矩阵，至少覆盖 Windows PowerShell 和 Unix shell 的成功命令、失败命令、环境变量读取、路径输出、UTF-8 中文输出。
+
+**验收标准：**
+- 测试覆盖成功命令、非零退出、超时、输出截断。
+- Windows PowerShell 路径必须有自动化测试；Unix shell 可在 CI 或手动记录中覆盖。
+- 文档明确不同平台 shell 语法不兼容，模型生成命令时应基于当前平台。
+
+### Phase 5：会话持久化
+
+#### Task 5.1 — 会话模型与存储
+
+**要求：**
+- 实现 `Session`、`SessionManager`。
+- 保存完整 messages，包括 tool calls 和 tool results。
+- 存储到 `.minicode/sessions/`。
+
+**验收标准：**
+- 单测覆盖 create/save/load/list/delete。
+- 自动保存发生在每轮 Agent Loop 完成后。
+- 集成测试覆盖：Agent Loop 完成后保存会话，再加载会话继续追加一轮消息。
+
+#### v0.2 发布 Gate
+
+必须全部满足：
+- `uv run ruff check .` 通过。
+- `uv run mypy src/minicode` 通过。
+- `uv run pytest --cov=src/minicode --cov-report=term` 覆盖率不低于 70%。
+- 至少 2 个关键路径集成测试通过：只读 Agent Loop、会话保存/恢复、权限拒绝工具执行。
+- 手动测试：创建文件、编辑文件、运行简单 shell 命令、恢复会话。
+
+---
+
+## v0.3：斜杠命令与会话操作
+
+> **目标：** 加入常用 slash commands，让已有会话和上下文操作接近日常可用。
+
+### Phase 6：斜杠命令
+
+**优先级：**
+1. `/quit`、`/exit`、`/q`
+2. `/help`
+3. `/clear`
+4. `/session list|switch|delete`
+5. `/config show`
+
+**验收标准：**
+- 命令路由有单元测试。
+- 每个命令失败时给出可读错误。
+- `/help` 只显示已经实现的命令。
+- 集成测试覆盖：通过命令切换会话、清空上下文、查看配置。
+
+#### v0.3 发布 Gate
+
+必须全部满足：
+- `uv run ruff check .` 通过。
+- `uv run mypy src/minicode` 通过。
+- `uv run pytest --cov=src/minicode --cov-report=term` 覆盖率不低于 75%。
+- README 更新已实现命令和配置示例。
+
+---
+
+## v0.4：记忆与多 Provider 体验
+
+> **目标：** 在稳定命令系统基础上加入记忆和多 OpenAI-compatible Provider 切换。
+
+### Phase 7：记忆系统
+
+**要求：**
+- 使用 Markdown + YAML frontmatter 存储记忆。
+- 每条记忆包含 `created_at`、`updated_at`、`source`、`scope`、`confidence` 元数据。
+- `get_all_content()` 必须限制总注入长度，默认 8,000 字符。
+- 注入 system prompt 时标明“用户记忆，可能不完整或过期”。
+- 当记忆名称或 scope 冲突时，按 `updated_at` 优先，并在 debug 日志记录冲突。
+- 过期策略：默认不删除旧记忆，但注入时优先选择较新、较高 confidence、scope 匹配当前 workspace 的记忆。
+
+**验收标准：**
+- 测试覆盖 add/list/delete/frontmatter 解析/长度限制/冲突处理/过期排序。
+- 手动测试：添加偏好后，新会话能读到该偏好。
+
+### Phase 8：多 Provider 切换体验
+
+**要求：**
+- v0.4 先只做多个 OpenAI-compatible Provider。
+- 支持配置多个 base_url/api_key/model。
+- 不在 v0.4 动态写入用户全局配置，避免误改用户文件；先支持编辑 YAML 后读取。
+
+**验收标准：**
+- `/provider list`、`/provider switch`、`/model list`、`/model switch` 可用。
+- 切换后下一轮对话使用新 provider/model。
+
+#### v0.4 发布 Gate
+
+必须全部满足：
+- `uv run ruff check .` 通过。
+- `uv run mypy src/minicode` 通过。
+- `uv run pytest --cov=src/minicode --cov-report=term` 覆盖率不低于 78%。
+- 集成测试覆盖：记忆注入 system prompt、多 Provider 切换后对话使用新 provider。
+- README 更新记忆和多 Provider 配置示例。
+
+---
+
+## v1.0：开源发布质量
+
+> **目标：** 从“能用的简历项目”提升为“别人可以安装、贡献、信任”的开源项目。
+
+### Phase 9：错误处理与稳定性
+
+**要求：**
+- 网络错误最多重试 3 次，指数退避。
+- 401、429、5xx 分别显示具体建议。
+- 工具错误返回给模型，同时渲染给用户。
+- 全局异常记录 debug 日志并优雅退出。
+
+**验收标准：**
+- 断网、无效 API key、限流、工具异常均有测试或手动记录。
+
+### Phase 10：Anthropic Provider
+
+**要求：**
+- 将内部 OpenAI-compatible 消息格式转换为 Anthropic messages/tools。
+- 支持文本和工具调用。
+- Anthropic 流式事件转换为内部 chunk。
+
+**验收标准：**
+- 格式转换有单元测试。
+- 手动测试 Claude API 完成一次带工具调用的对话。
+
+### Phase 11：CI、质量和发布
+
+**要求：**
+- GitHub Actions 运行 ruff、mypy、pytest。
+- 覆盖率不低于 80%。
+- README、CONTRIBUTING、CHANGELOG、LICENSE 齐全。
+- 配置 PyPI 元信息和 GitHub Release。
+
+**验收标准：**
+- CI 全绿。
+- `uv build` 成功。
+- 从干净环境安装后可运行 `minicode --help`。
+- CI 至少覆盖 Python 3.12；可选增加 Python 3.13 兼容性矩阵。
+
+---
+
+## 功能暂缓清单
+
+这些功能有价值，但不进入 v0.1/v0.2，避免拖慢主线：
+
+| 功能 | 暂缓原因 | 建议版本 |
+|------|----------|----------|
+| PDF/图片读取 | 涉及额外依赖、二进制解析、多模态模型差异 | v1.x |
+| 并行工具执行 | ReAct 正确性优先，串行更容易调试 | v1.x |
+| 动态写入全局 Provider 配置 | 容易误改用户配置，交互确认复杂 | v1.x |
+| 复杂状态栏和补全 | 体验加分但不是主线能力 | v0.4+ |
+| 精确 token tokenizer | 先用字符截断和上限告警即可 | v1.x |
+
+## 风险与缓解
 
 | 风险 | 影响 | 缓解措施 |
 |------|------|----------|
-| prompt_toolkit 异步模式踩坑 | Phase 1 延迟 | 先实现最简版本，再逐步整合 |
-| ripgrep 不可用 | 搜索功能降级 | fallback 到 Python re + rglob |
-| Anthropic API 格式翻译复杂 | Phase 4 延期 | 确保内部格式足够通用；Phase 1-3 只关注 OpenAI 兼容 |
-| token 消耗过大 | 成本失控 | 实现 token 计数和上限告警；限制上下文窗口 |
-| 流式解析错误 | 用户看到乱码 | 充分的单元测试 + 错误恢复 |
+| prompt_toolkit 异步输入复杂 | 阻塞 Phase 1 | v0.1 只做单行输入，复杂输入后移 |
+| 流式 tool_call delta 难处理 | Agent Loop 不稳定 | v0.1 文本流式，工具调用可先非流式 |
+| Anthropic 后期适配导致重构 | Provider 抽象泄露 OpenAI 假设 | v0.1 用 mock Anthropic contract test 验证内部消息模型 |
+| 工具越权访问文件 | 安全风险高 | 默认 workspace root 限制 + 敏感文件 deny |
+| 写入/shell 工具破坏项目 | 用户信任下降 | v0.2 才引入，并先完成参数级权限 |
+| Windows shell 差异 | 跨平台失败 | 工具命名为 shell，建立 PowerShell/Unix 兼容矩阵 |
+| 记忆污染上下文 | 回复偏离任务 | v0.4 注入长度限制、scope/confidence/updated_at 排序，并标明记忆可能过期 |
+
+## 简历亮点映射
+
+| 亮点 | 在哪个版本形成 |
+|------|----------------|
+| OpenAI-compatible Provider 抽象 | v0.1 |
+| 流式终端渲染 | v0.1 |
+| 插件式只读工具系统 | v0.1 |
+| ReAct Agent Loop | v0.1 |
+| Workspace 安全边界 | v0.1 |
+| 参数级权限控制 | v0.2 |
+| 会话持久化 | v0.2 |
+| Slash command 系统 | v0.3 |
+| Markdown 记忆系统 | v0.4 |
+| 多 Provider 适配 | v0.4/v1.0 |
+| CI + 类型检查 + 覆盖率 | v1.0 |
