@@ -11,9 +11,6 @@ build/
 venv/
 env/
 
-# uv
-uv.lock
-
 # Project runtime data (sessions, memory, local config)
 .minicode/
 
@@ -23,6 +20,9 @@ uv.lock
 # Claude Code local settings
 .claude/
 CLAUDE.md
+
+# codex
+.codex/
 
 # IDE
 .vscode/
@@ -37,3 +37,4 @@ Thumbs.db
 # Environment
 .env
 .env.local
+*.log
