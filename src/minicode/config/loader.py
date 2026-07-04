@@ -18,11 +18,7 @@ from typing import Any
 import yaml
 
 from minicode.config.models import AppConfig
-
-
-class ConfigError(Exception):
-    """配置相关的错误。"""
-
+from minicode.utils.exceptions import ConfigError
 
 # ── 环境变量映射 ──────────────────────────────────────────────────
 # 键为环境变量名，值为配置字典中的嵌套路径
@@ -117,14 +113,19 @@ def _resolve_placeholders_recursive(data: dict[str, Any]) -> dict[str, Any]:
 def _get_defaults() -> dict[str, Any]:
     """获取代码内建默认配置。"""
     return {
-        "default_provider": "openai",
-        "default_model": "gpt-4o-mini",
-        "max_tokens": 4096,
+        "default_provider": "deepseek",
+        "default_model": "deepseek-v4-flash",
+        "max_tokens": 16384,
         "providers": {
             "openai": {
                 "api_key": "",
                 "base_url": "https://api.openai.com/v1",
                 "models": ["gpt-4o", "gpt-4o-mini"],
+            },
+            "deepseek": {
+                "api_key": "",
+                "base_url": "https://api.deepseek.com",
+                "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
             },
         },
         "agent": {

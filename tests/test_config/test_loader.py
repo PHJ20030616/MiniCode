@@ -61,9 +61,9 @@ class TestDefaultConfig:
     def test_loads_without_files_or_env(self, fake_home: Path) -> None:
         """验证无配置文件和环境变量时默认配置结构正确。"""
         config = AppConfig()
-        assert config.default_provider == "openai"
-        assert config.default_model == "gpt-4o-mini"
-        assert config.max_tokens == 4096
+        assert config.default_provider == "deepseek"
+        assert config.default_model == "deepseek-v4-flash"
+        assert config.max_tokens == 16384
         assert config.agent.max_rounds == 20
         assert config.agent.stream is True
         assert config.permissions.trust_mode is False
@@ -71,15 +71,16 @@ class TestDefaultConfig:
     def test_default_provider_has_openai(
         self, fake_home: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """验证默认提供了 openai 提供商配置。"""
-        monkeypatch.setenv("MINICODE_OPENAI_API_KEY", "sk-test")
+        """验证默认提供了 openai 和 deepseek 两个提供商配置。"""
+        monkeypatch.setenv("MINICODE_DEEPSEEK_API_KEY", "sk-default-key")
         config = load()
         assert "openai" in config.providers
         assert config.providers["openai"].base_url == "https://api.openai.com/v1"
         assert "gpt-4o" in config.providers["openai"].models
+        assert "deepseek" in config.providers
 
     def test_default_missing_api_key_error(self, fake_home: Path) -> None:
-        """验证默认 openai 没有 API key 时抛出 ConfigError。"""
+        """验证默认 deepseek 没有 API key 时抛出 ConfigError。"""
         with pytest.raises(ConfigError, match="未配置 API key"):
             load()
 
@@ -92,6 +93,7 @@ class TestGlobalConfig:
         _write_yaml(
             fake_home / ".minicode" / "config.yaml",
             {
+                "default_provider": "openai",
                 "default_model": "gpt-4o",
                 "max_tokens": 8192,
                 "providers": {
@@ -104,6 +106,7 @@ class TestGlobalConfig:
             },
         )
         config = load()
+        assert config.default_provider == "openai"
         assert config.default_model == "gpt-4o"
         assert config.max_tokens == 8192
         assert config.providers["openai"].api_key == "sk-global-key"
@@ -150,6 +153,7 @@ class TestProjectConfig:
         _write_yaml(
             fake_home / ".minicode" / "config.yaml",
             {
+                "default_provider": "openai",
                 "default_model": "gpt-4o",
                 "providers": {
                     "openai": {
@@ -204,6 +208,7 @@ class TestProjectConfig:
         _write_yaml(
             fake_workspace / ".minicode" / "config.yaml",
             {
+                "default_provider": "openai",
                 "providers": {
                     "openai": {
                         "api_key": "sk-cwd",
@@ -227,6 +232,7 @@ class TestExplicitConfig:
         _write_yaml(
             fake_home / ".minicode" / "config.yaml",
             {
+                "default_provider": "openai",
                 "providers": {
                     "openai": {
                         "api_key": "sk-global",
@@ -294,6 +300,7 @@ class TestEnvVarOverride:
         _write_yaml(
             fake_home / ".minicode" / "config.yaml",
             {
+                "default_provider": "openai",
                 "default_model": "gpt-4o",
                 "providers": {
                     "openai": {
@@ -310,16 +317,16 @@ class TestEnvVarOverride:
 
     def test_env_provider_api_key(self, fake_home: Path, monkeypatch) -> None:
         """验证通过环境变量设置提供商 API key。"""
-        monkeypatch.setenv("MINICODE_OPENAI_API_KEY", "sk-from-env")
+        monkeypatch.setenv("MINICODE_DEEPSEEK_API_KEY", "sk-deepseek")
         config = load()
-        assert config.providers["openai"].api_key == "sk-from-env"
+        assert config.providers["deepseek"].api_key == "sk-deepseek"
 
     def test_env_provider_base_url(self, fake_home: Path, monkeypatch) -> None:
         """验证通过环境变量设置提供商 base URL。"""
-        monkeypatch.setenv("MINICODE_OPENAI_BASE_URL", "https://custom.openai.com/v1")
-        monkeypatch.setenv("MINICODE_OPENAI_API_KEY", "sk-key")
+        monkeypatch.setenv("MINICODE_DEEPSEEK_BASE_URL", "https://custom.deepseek.com/v1")
+        monkeypatch.setenv("MINICODE_DEEPSEEK_API_KEY", "sk-key")
         config = load()
-        assert config.providers["openai"].base_url == "https://custom.openai.com/v1"
+        assert config.providers["deepseek"].base_url == "https://custom.deepseek.com/v1"
 
     def test_env_discover_new_provider(self, fake_home: Path, monkeypatch) -> None:
         """验证环境变量可以动态发现新的提供商。"""
@@ -336,7 +343,7 @@ class TestEnvVarOverride:
         """验证环境变量可以覆盖 agent 配置。"""
         monkeypatch.setenv("MINICODE_MAX_ROUNDS", "10")
         monkeypatch.setenv("MINICODE_STREAM", "false")
-        monkeypatch.setenv("MINICODE_OPENAI_API_KEY", "sk-key")
+        monkeypatch.setenv("MINICODE_DEEPSEEK_API_KEY", "sk-key")
         config = load()
         assert config.agent.max_rounds == 10
         assert config.agent.stream is False
@@ -349,21 +356,21 @@ class TestPlaceholderResolution:
         self, fake_home: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """验证 YAML 中的 ${ENV_VAR} 占位符被正确解析。"""
-        monkeypatch.setenv("MY_API_KEY", "sk-resolved")
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-resolved")
         _write_yaml(
             fake_home / ".minicode" / "config.yaml",
             {
                 "providers": {
-                    "openai": {
-                        "api_key": "${MY_API_KEY}",
-                        "base_url": "https://api.openai.com/v1",
-                        "models": ["gpt-4o"],
+                    "deepseek": {
+                        "api_key": "${DEEPSEEK_API_KEY}",
+                        "base_url": "https://api.deepseek.com",
+                        "models": ["deepseek-v4-flash"],
                     },
                 },
             },
         )
         config = load()
-        assert config.providers["openai"].api_key == "sk-resolved"
+        assert config.providers["deepseek"].api_key == "sk-resolved"
 
     def test_env_placeholder_missing_var(
         self, fake_home: Path
@@ -373,10 +380,10 @@ class TestPlaceholderResolution:
             fake_home / ".minicode" / "config.yaml",
             {
                 "providers": {
-                    "openai": {
+                    "deepseek": {
                         "api_key": "${UNDEFINED_VAR}",
-                        "base_url": "https://api.openai.com/v1",
-                        "models": ["gpt-4o"],
+                        "base_url": "https://api.deepseek.com",
+                        "models": ["deepseek-v4-flash"],
                     },
                 },
             },
@@ -396,7 +403,7 @@ class TestCliOverride:
     ) -> None:
         """验证 CLI 参数覆盖环境变量。"""
         monkeypatch.setenv("MINICODE_DEFAULT_MODEL", "gpt-4o-from-env")
-        monkeypatch.setenv("MINICODE_OPENAI_API_KEY", "sk-key")
+        monkeypatch.setenv("MINICODE_DEEPSEEK_API_KEY", "sk-key")
         config = load(cli_overrides={"model": "gpt-4o-mini-from-cli"})
         assert config.default_model == "gpt-4o-mini-from-cli"
 
@@ -453,7 +460,7 @@ class TestValidation:
         msg = str(exc_info.value)
         assert "未配置 API key" in msg
         assert "环境变量" in msg
-        assert "OPENAI_API_KEY" in msg
+        assert "DEEPSEEK_API_KEY" in msg
 
     def test_missing_provider_error(
         self, fake_home: Path, monkeypatch: pytest.MonkeyPatch
@@ -483,12 +490,13 @@ class TestFullPriorityChain:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """验证完整链条：默认 < 全局 < 项目 < 显式配置 < 环境变量 < CLI。"""
-        # 第 1 层：默认值 -> default_model = "gpt-4o-mini"
+        # 第 1 层：默认值 -> default_model = "deepseek-v4-flash"
 
         # 第 2 层：全局配置
         _write_yaml(
             fake_home / ".minicode" / "config.yaml",
             {
+                "default_provider": "openai",
                 "default_model": "gpt-4o",
                 "max_tokens": 4096,
                 "providers": {
@@ -524,6 +532,7 @@ class TestFullPriorityChain:
             cli_overrides={"model": "cli-model"},
         )
 
+        assert config.default_provider == "openai"  # 全局配置覆盖
         assert config.default_model == "cli-model"  # CLI 最高优先级
         assert config.max_tokens == 8192  # 项目配置覆盖全局
         assert config.providers["openai"].api_key == "sk-global"  # 全局配置保留

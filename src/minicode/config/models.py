@@ -40,14 +40,19 @@ class AppConfig(BaseModel):
                 base_url="https://api.openai.com/v1",
                 models=["gpt-4o", "gpt-4o-mini"],
             ),
+            "deepseek": ProviderConfig(
+                api_key="",
+                base_url="https://api.deepseek.com",
+                models=["deepseek-v4-flash","deepseek-v4-pro"],
+            ),
         }
     )
     """所有已配置的 AI 提供商，键为提供商名称。"""
-    default_provider: str = "openai"
+    default_provider: str = "deepseek"
     """默认使用的提供商名称。"""
-    default_model: str = "gpt-4o-mini"
+    default_model: str = "deepseek-v4-flash"
     """默认使用的模型名称。"""
-    max_tokens: int = 4096
+    max_tokens: int = 16384
     """模型响应的最大 token 数。"""
     agent: AgentConfig = Field(default_factory=AgentConfig)
     """Agent 循环相关配置。"""

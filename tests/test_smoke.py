@@ -65,7 +65,7 @@ class TestCliNoSubcommand:
         self, fake_home: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """验证有 API key 时 CLI 正常退出。"""
-        monkeypatch.setenv("MINICODE_OPENAI_API_KEY", "sk-test")
+        monkeypatch.setenv("MINICODE_DEEPSEEK_API_KEY", "sk-test")
         result = CliRunner().invoke(app, [])
         assert result.exit_code == 0
 
@@ -73,7 +73,7 @@ class TestCliNoSubcommand:
         self, fake_home: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """验证 --model 参数在有 API key 时正常解析。"""
-        monkeypatch.setenv("MINICODE_OPENAI_API_KEY", "sk-test")
+        monkeypatch.setenv("MINICODE_DEEPSEEK_API_KEY", "sk-test")
         result = CliRunner().invoke(app, ["--model", "gpt-4o"])
         assert result.exit_code == 0
         assert "Missing command" not in result.output
@@ -99,6 +99,7 @@ class TestCliNoSubcommand:
         _write_yaml(
             explicit,
             {
+                "default_provider": "openai",
                 "providers": {
                     "openai": {
                         "api_key": "sk-from-config-flag",
