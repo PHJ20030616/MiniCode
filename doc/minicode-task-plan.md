@@ -196,7 +196,7 @@ uv add --dev pytest pytest-asyncio pytest-mock pytest-cov mypy ruff
 **要求：**
 - 实现 `read_file`。
 - 支持 `file_path`、`offset`、`limit`。
-- 只支持文本文件；PDF/图片进入后续版本。
+- 只支持文本文件（包括各种代码文件）；PDF/图片进入后续版本。
 - 输出做长度截断，默认最多 20,000 字符。
 
 **关键文件：**
