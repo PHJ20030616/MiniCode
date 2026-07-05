@@ -11,6 +11,8 @@
 
 这个计划按可交付版本拆分，而不是按“完整功能清单”一次性铺开。每个版本结束时都必须有一个可运行、可测试、可演示的产品。
 
+> **Provider 命名口径：** 文档中的 `OpenAI-compatible` 指协议和 SDK 兼容层，并不限定最终接入 OpenAI 官方接口。最终真实接口验收统一使用 DeepSeek 的 OpenAI-compatible API；单元测试仍以 mock client 验证协议映射。
+
 | 版本 | 目标 | 不做 |
 |------|------|------|
 | v0.1 | OpenAI-compatible 流式对话 + 只读工具 + ReAct 主闭环 | 写文件、执行 shell、记忆、多 Provider |
@@ -24,7 +26,7 @@
 1. **主线优先**：先让“用户提问 -> 模型读项目文件 -> 回答”稳定跑通。
 2. **MVP 边界硬化**：v0.1 只做只读工具，避免权限和破坏性操作拖慢主线。
 3. **测试跟随开发**：每个 Phase 都有自己的测试 gate，不把质量集中推迟到最后。
-4. **Provider 简化**：v0.1 只支持 OpenAI-compatible API，工具调用可以先非流式，文本回复保持流式。
+4. **Provider 简化**：v0.1 只支持 OpenAI-compatible API，默认按 DeepSeek 兼容接口完成真实验收；工具调用可以先非流式，文本回复保持流式。
 5. **安全默认值**：所有文件工具默认限制在 workspace root 内，敏感文件默认拒绝读取。
 6. **手动验收不可替代单测**：手动测试只验证真实体验，核心逻辑必须有自动化测试。
 
@@ -148,7 +150,7 @@ uv add --dev pytest pytest-asyncio pytest-mock pytest-cov mypy ruff
 
 **验收标准：**
 - 单元测试用 mock client 验证文本 delta 被正确转换为内部 chunk。
-- 手动测试可使用 OpenAI、DeepSeek 或兼容中转站完成一次纯文本对话。
+- 最终手动验收使用 DeepSeek 的 OpenAI-compatible 接口完成一次纯文本对话；如需排查兼容性，可补充使用 OpenAI 官方接口或兼容中转站。
 
 #### Task 1.3 — CLI 输入与渲染
 
@@ -252,6 +254,7 @@ uv add --dev pytest pytest-asyncio pytest-mock pytest-cov mypy ruff
 - `uv run mypy src/minicode` 通过，允许在 pyproject 中先采用适度严格配置，不强行 `strict = true`。
 - `uv run pytest --cov=src/minicode --cov-report=term` 覆盖率不低于 60%。
 - 至少 1 个关键路径集成测试通过：Agent Loop + mock Provider + 只读工具。
+- 使用 DeepSeek OpenAI-compatible 接口完成一次真实手动验收：普通流式对话，以及“读取 README.md 并总结内容”的只读 Agent 链路。
 - README 包含安装、配置、v0.1 功能和限制。
 - 提交 `uv.lock`，保证依赖可复现。
 

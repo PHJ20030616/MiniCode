@@ -19,6 +19,7 @@ from minicode.providers.base import (
     ToolMessage,
     UsageInfo,
 )
+from minicode.providers.openai_compatible import OpenAICompatibleProvider
 from minicode.providers.registry import MockProvider, ProviderRegistry
 
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
     "FunctionCall",
     "Message",
     "MockProvider",
+    "OpenAICompatibleProvider",
     "PartialToolCall",
     "ProviderRegistry",
     "StreamChunk",
