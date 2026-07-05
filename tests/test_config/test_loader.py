@@ -36,10 +36,14 @@ def _write_yaml(path: Path, data: dict) -> None:
 
 @pytest.fixture
 def fake_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    """将 Path.home() 指向临时目录，避免影响真实用户配置。"""
+    """将 Path.home() 指向临时目录、隔离 workspace，避免影响真实配置。"""
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setattr(Path, "home", lambda: home)
+    # 同时隔离工作目录，避免读取当前项目的 .minicode/config.yaml
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
     return home
 
 
@@ -55,6 +59,7 @@ def fake_workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
 # ── 测试用例 ─────────────────────────────────────────────────────
 
 
+@pytest.mark.usefixtures("clean_minicode_env")
 class TestDefaultConfig:
     """无配置文件、无环境变量时的默认配置。"""
 
@@ -85,6 +90,7 @@ class TestDefaultConfig:
             load()
 
 
+@pytest.mark.usefixtures("clean_minicode_env")
 class TestGlobalConfig:
     """~/.minicode/config.yaml 全局配置加载。"""
 
@@ -142,6 +148,7 @@ class TestGlobalConfig:
             load()
 
 
+@pytest.mark.usefixtures("clean_minicode_env")
 class TestProjectConfig:
     """./.minicode/config.yaml 项目配置加载。"""
 
@@ -221,6 +228,7 @@ class TestProjectConfig:
         assert config.providers["openai"].api_key == "sk-cwd"
 
 
+@pytest.mark.usefixtures("clean_minicode_env")
 class TestExplicitConfig:
     """通过 --config 显式指定的配置文件。"""
 
@@ -289,6 +297,7 @@ class TestExplicitConfig:
         assert config.default_provider == "deepseek"
 
 
+@pytest.mark.usefixtures("clean_minicode_env")
 class TestEnvVarOverride:
     """环境变量覆盖配置。"""
 
@@ -349,6 +358,7 @@ class TestEnvVarOverride:
         assert config.agent.stream is False
 
 
+@pytest.mark.usefixtures("clean_minicode_env")
 class TestPlaceholderResolution:
     """${ENV_VAR} 占位符解析。"""
 
@@ -395,6 +405,7 @@ class TestPlaceholderResolution:
         assert "未设置" in msg
 
 
+@pytest.mark.usefixtures("clean_minicode_env")
 class TestCliOverride:
     """CLI 参数覆盖（最高优先级）。"""
 
@@ -450,6 +461,7 @@ class TestCliOverride:
         assert config.default_provider == "provider_b"
 
 
+@pytest.mark.usefixtures("clean_minicode_env")
 class TestValidation:
     """配置验证。"""
 
@@ -459,6 +471,9 @@ class TestValidation:
             load()
         msg = str(exc_info.value)
         assert "未配置 API key" in msg
+        assert "~/.minicode/config.yaml" in msg
+        assert "./.minicode/config.yaml" in msg
+        assert "--config" in msg
         assert "环境变量" in msg
         assert "DEEPSEEK_API_KEY" in msg
 
@@ -480,6 +495,7 @@ class TestValidation:
             load()
 
 
+@pytest.mark.usefixtures("clean_minicode_env")
 class TestFullPriorityChain:
     """完整优先级链验证。"""
 

@@ -1,11 +1,13 @@
 """MiniCode 命令行入口。"""
 
+import asyncio
 from pathlib import Path
 
 import structlog
 import typer
 
 from minicode import __version__
+from minicode.cli.app import ChatApp
 from minicode.config.loader import load
 from minicode.utils.exceptions import ConfigError, MiniCodeError
 from minicode.utils.log import get_logger, setup_logging
@@ -50,7 +52,10 @@ def main(
     config: Path | None = typer.Option(  # noqa: B008
         None,
         "--config",
-        help="配置文件路径。",
+        help=(
+            "额外配置文件路径；默认还会读取 ~/.minicode/config.yaml "
+            "和 <workspace>/.minicode/config.yaml。"
+        ),
     ),
     workspace: Path | None = typer.Option(  # noqa: B008
         None,
@@ -114,8 +119,8 @@ def main(
             default_model=app_config.default_model,
         )
 
-        # TODO: 进入 Agent Loop（Phase 1+ 实现）
-        typer.echo("MiniCode 启动成功。进入对话模式的功能将在后续版本实现。")
+        # 进入对话模式
+        asyncio.run(ChatApp(app_config).run())
 
     except ConfigError as e:
         typer.echo(f"配置错误：{e}", err=True)

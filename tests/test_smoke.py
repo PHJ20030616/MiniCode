@@ -19,10 +19,14 @@ def _write_yaml(path: Path, data: dict) -> None:
 
 @pytest.fixture
 def fake_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    """将 Path.home() 指向临时目录，避免影响真实用户配置。"""
+    """将 Path.home() 指向临时目录，并隔离工作目录，避免影响真实配置。"""
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setattr(Path, "home", lambda: home)
+    # 隔离工作目录，避免读取项目 .minicode/config.yaml
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
     return home
 
 
@@ -51,8 +55,18 @@ def test_cli_help() -> None:
     assert "--version" in result.output
 
 
+@pytest.mark.usefixtures("clean_minicode_env")
 class TestCliNoSubcommand:
     """验证无子命令时 CLI 能正常解析参数。"""
+
+    @pytest.fixture(autouse=True)
+    def _mock_chat_app_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Mock ChatApp.run 避免进入真实交互循环。"""
+
+        async def _run(self: object) -> None:
+            pass
+
+        monkeypatch.setattr("minicode.cli.app.ChatApp.run", _run)
 
     def test_no_args_no_api_key(self, fake_home: Path) -> None:
         """验证无 API key 时 CLI 非零退出并输出清晰错误。"""

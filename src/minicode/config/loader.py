@@ -4,10 +4,11 @@
   1. 代码默认值
   2. ~/.minicode/config.yaml（全局用户配置）
   3. ./.minicode/config.yaml（项目配置）
-  4. 环境变量（MINICODE_*）
-  5. CLI 参数覆盖
+  4. --config 指定的配置文件（如果有）
+  5. 环境变量（MINICODE_*）
+  6. CLI 参数覆盖
 
-环境变量 ${VAR_NAME} 占位符在第 3 步后解析。
+环境变量 ${VAR_NAME} 占位符在 YAML 配置合并后解析。
 """
 
 import os
@@ -207,9 +208,11 @@ def _validate_api_key(config: AppConfig) -> None:
         raise ConfigError(
             f"提供商 '{provider_name}' 未配置 API key。\n"
             f"请通过以下方式之一设置：\n"
-            f"  1. 配置文件：在 ~/.minicode/config.yaml 中配置 {provider_name}.api_key\n"
-            f"  2. 环境变量：设置 {env_var_name}\n"
-            f"  3. 使用 --provider 参数切换到其他已配置的提供商"
+            f"  1. 全局配置：在 ~/.minicode/config.yaml 中配置 providers.{provider_name}.api_key\n"
+            f"  2. 项目配置：在 ./.minicode/config.yaml 中配置 providers.{provider_name}.api_key\n"
+            f"  3. 显式配置：使用 --config path/to/config.yaml 指定配置文件\n"
+            f"  4. 环境变量：设置 {env_var_name}\n"
+            f"  5. 使用 --provider 参数切换到其他已配置的提供商"
         )
 
 
