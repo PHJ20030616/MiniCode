@@ -120,7 +120,7 @@ def main(
         )
 
         # 进入对话模式
-        asyncio.run(ChatApp(app_config).run())
+        asyncio.run(ChatApp(app_config, workspace_root=workspace_path).run())
 
     except ConfigError as e:
         typer.echo(f"配置错误：{e}", err=True)

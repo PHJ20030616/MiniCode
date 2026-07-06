@@ -528,6 +528,60 @@ class TestNonStreamChat:
         assert chunks[1].tool_call.arguments == '{"file_path": "test.txt"}'
         assert chunks[2].type == "done"
 
+    async def test_non_stream_multi_tool_calls(self, mock_client: Any) -> None:
+        """非流式多工具调用应分别有正确的 index 0、1。"""
+        mock_client.chat.completions.create.return_value = MockNonStreamingResponse(
+            choices=[
+                MockNonStreamingChoice(
+                    message=MockNonStreamingMessage(
+                        content=None,
+                        tool_calls=[
+                            MockNonStreamingToolCall(
+                                id="call_001",
+                                function=MockNonStreamingFunction(
+                                    name="glob",
+                                    arguments='{"pattern": "*.py"}',
+                                ),
+                            ),
+                            MockNonStreamingToolCall(
+                                id="call_002",
+                                function=MockNonStreamingFunction(
+                                    name="read_file",
+                                    arguments='{"file_path": "main.py"}',
+                                ),
+                            ),
+                        ],
+                    ),
+                )
+            ],
+            usage=MockUsage(25, 15, 40),
+        )
+
+        provider = make_provider()
+        chunks = [
+            chunk
+            async for chunk in provider.chat(
+                messages=[Message(role="user", content="Find and read")], stream=False
+            )
+        ]
+
+        # 提取 tool_call_delta 块
+        tool_chunks = [c for c in chunks if c.type == "tool_call_delta"]
+        assert len(tool_chunks) == 2
+        assert tool_chunks[0].tool_call is not None
+        assert tool_chunks[0].tool_call.index == 0
+        assert tool_chunks[0].tool_call.id == "call_001"
+        assert tool_chunks[0].tool_call.name == "glob"
+        assert tool_chunks[1].tool_call is not None
+        assert tool_chunks[1].tool_call.index == 1
+        assert tool_chunks[1].tool_call.id == "call_002"
+        assert tool_chunks[1].tool_call.name == "read_file"
+        # arguments 不能合并
+        assert tool_chunks[0].tool_call.arguments == '{"pattern": "*.py"}'
+        assert tool_chunks[1].tool_call.arguments == '{"file_path": "main.py"}'
+        # 最后应有一个 done
+        assert chunks[-1].type == "done"
+
     async def test_non_stream_content_none(self, mock_client: Any) -> None:
         """非流式响应 content 为 None 时不应产生 text_delta。"""
         mock_client.chat.completions.create.return_value = MockNonStreamingResponse(

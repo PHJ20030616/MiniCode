@@ -209,12 +209,12 @@ class OpenAICompatibleProvider(BaseProvider):
 
         # 处理工具调用（非流式 = 完整 tool_calls）
         if choice.message.tool_calls:
-            for tc in choice.message.tool_calls:
+            for idx, tc in enumerate(choice.message.tool_calls):
                 yield StreamChunk(
                     type="tool_call_delta",
                     tool_call=PartialToolCall(
                         id=tc.id,
-                        index=0,
+                        index=idx,
                         name=tc.function.name,
                         arguments=tc.function.arguments,
                     ),
