@@ -5,12 +5,16 @@
 
 from minicode.tools.base import BaseTool, ToolResult
 from minicode.tools.file_read import ReadFile
+from minicode.tools.glob import GlobFiles
+from minicode.tools.grep import GrepFiles
 from minicode.tools.registry import ToolRegistry
 
 
 def register_builtin_tools(registry: ToolRegistry) -> None:
     """将所有内置工具注册到给定的注册器中。"""
     registry.register(ReadFile)
+    registry.register(GlobFiles)
+    registry.register(GrepFiles)
 
 
 def create_default_registry() -> ToolRegistry:
@@ -22,6 +26,8 @@ def create_default_registry() -> ToolRegistry:
 
 __all__ = [
     "BaseTool",
+    "GlobFiles",
+    "GrepFiles",
     "ReadFile",
     "ToolRegistry",
     "ToolResult",
