@@ -20,6 +20,7 @@ from rich.text import Text
 
 from minicode.agent.context import build_messages
 from minicode.agent.system_prompt import build_system_prompt
+from minicode.permissions.checker import check_permission
 from minicode.providers.base import (
     FunctionCall,
     Message,
@@ -33,8 +34,10 @@ from minicode.utils.log import get_logger
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
+    from minicode.cli.confirm import PermissionConfirmer
     from minicode.cli.renderer import StreamingRenderer
     from minicode.config.models import AppConfig
+    from minicode.permissions.store import PermissionStore
     from minicode.providers.base import BaseProvider
     from minicode.tools.registry import ToolRegistry
 
@@ -63,6 +66,8 @@ class AgentLoop:
         renderer: StreamingRenderer,
         config: AppConfig,
         workspace_root: Path | None = None,
+        permission_store: PermissionStore | None = None,
+        permission_confirmer: PermissionConfirmer | None = None,
     ) -> None:
         """初始化 Agent Loop。
 
@@ -78,6 +83,8 @@ class AgentLoop:
         self.renderer = renderer
         self.config = config
         self.workspace_root = workspace_root or Path.cwd()
+        self.permission_store = permission_store
+        self.permission_confirmer = permission_confirmer
         self.messages: list[Message] = []
         self.system_prompt = build_system_prompt(tool_registry)
 
@@ -264,6 +271,11 @@ class AgentLoop:
     async def _execute_tools(self, tool_calls: list[ToolCall]) -> None:
         """串行执行工具调用，并将结果追加到对话历史。
 
+        在工具执行前进行权限检查：
+        - safe 级别直接执行
+        - deny 级别不执行，追加拒绝信息
+        - caution/dangerous 级别根据 trust_mode、store、confirmer 决策
+
         Args:
             tool_calls: 模型返回的工具调用列表。
         """
@@ -280,6 +292,11 @@ class AgentLoop:
                         name=name,
                     )
                 )
+                continue
+
+            # 权限检查：工具执行前调用 check_permission()
+            if await self._check_tool_permission(name, args, tc):
+                # 返回 True 表示已拒绝，跳过执行
                 continue
 
             logger.debug("执行工具", tool=name, args=args)
@@ -308,3 +325,117 @@ class AgentLoop:
                     name=name,
                 )
             )
+
+    async def _check_tool_permission(
+        self,
+        tool_name: str,
+        arguments: dict[str, object],
+        tc: ToolCall,
+    ) -> bool:
+        """检查工具权限。返回 True 表示已拒绝（跳过执行）。
+
+        - safe：允许执行
+        - deny：拒绝执行，追加拒绝 ToolMessage
+        - caution/dangerous：
+          - trust_mode → 允许执行
+          - store 有匹配 → 允许执行
+          - confirmer 可用 → 询问用户
+          - 无 confirmer → 允许执行（向后兼容）
+
+        Args:
+            tool_name: 工具名称
+            arguments: 工具参数
+            tc: 原始 ToolCall（用于构造拒绝消息）
+
+        Returns:
+            True 表示不应执行工具，False 表示可以执行。
+        """
+        decision = check_permission(
+            tool_name=tool_name,
+            arguments=arguments,
+            workspace_root=self.workspace_root,
+            trust_mode=self.config.permissions.trust_mode,
+        )
+
+        # safe：直接执行
+        if decision.allowed_without_prompt:
+            return False
+
+        # deny：不执行，追加拒绝 ToolMessage
+        if decision.denied:
+            self.renderer.show_error(f"权限拒绝：{decision.summary}")
+            self.messages.append(
+                ToolMessage(
+                    content=f"权限拒绝：{decision.summary}",
+                    tool_call_id=tc.id,
+                    name=tool_name,
+                )
+            )
+            return True
+
+        # caution / dangerous：需要确认
+        # trust_mode 跳过确认
+        if self.config.permissions.trust_mode:
+            return False
+
+        # 检查 always-allow 存储
+        if self.permission_store is not None and decision.target_paths:  # noqa: SIM102
+            if self.permission_store.find_match(tool_name, decision.target_paths):
+                return False
+
+        # 询问用户
+        if self.permission_confirmer is not None:
+            result = await self.permission_confirmer.confirm(decision)
+
+            if result.action == "deny":
+                self.renderer.show_error(f"用户拒绝：{decision.summary}")
+                self.messages.append(
+                    ToolMessage(
+                        content=f"用户拒绝：{decision.summary}",
+                        tool_call_id=tc.id,
+                        name=tool_name,
+                    )
+                )
+                return True
+
+            if result.action == "always_allow":
+                # 将第一个目标路径转为 workspace 相对路径作为 pattern
+                if self.permission_store is not None and decision.target_paths:
+                    try:
+                        rel = decision.target_paths[0].relative_to(
+                            self.workspace_root
+                        )
+                        pattern = rel.as_posix()
+                        self.permission_store.add_rule(tool_name, pattern)
+                        self.renderer.show_info(
+                            f"已添加规则：{tool_name} 允许 {pattern}"
+                        )
+                    except ValueError:
+                        pass
+                return False
+
+            if result.action == "allow":
+                # 允许本次执行
+                return False
+
+            # 未知 action → 拒绝执行（fail-close）
+            self.renderer.show_error(f"权限确认返回值未知：{result.action}")
+            self.messages.append(
+                ToolMessage(
+                    content=f"权限拒绝：确认返回值未知（{result.action}）",
+                    tool_call_id=tc.id,
+                    name=tool_name,
+                )
+            )
+            return True
+
+        # 没有 confirmer 但有确认需求 → 拒绝执行，防止 fail-open
+        self.renderer.show_error(f"权限拒绝（无确认交互）：{decision.summary}")
+        self.messages.append(
+            ToolMessage(
+                content=f"权限拒绝：{decision.summary}",
+                tool_call_id=tc.id,
+                name=tool_name,
+            )
+        )
+        return True

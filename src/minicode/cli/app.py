@@ -79,6 +79,7 @@ class ChatApp:
         """获取 AgentLoop 实例（懒加载并缓存）。
 
         首次调用时创建 Provider 和 ToolRegistry，然后构建 AgentLoop。
+        同时创建 PermissionStore 和 PermissionConfirmer 用于权限确认。
         后续调用复用缓存的实例。
 
         Returns:
@@ -107,6 +108,13 @@ class ChatApp:
         )
 
         tool_registry = create_default_registry()
+        # 注入权限组件
+        from minicode.cli.confirm import PermissionConfirmer
+        from minicode.permissions.store import PermissionStore
+
+        permission_store = PermissionStore(self.workspace_root)
+        permission_confirmer = PermissionConfirmer(console=self.console)
+
         # 创建 AgentLoop
         self._agent_loop = AgentLoop(
             provider=provider,
@@ -114,6 +122,8 @@ class ChatApp:
             renderer=self.renderer,
             config=self.config,
             workspace_root=self.workspace_root,
+            permission_store=permission_store,
+            permission_confirmer=permission_confirmer,
         )
         return self._agent_loop
 

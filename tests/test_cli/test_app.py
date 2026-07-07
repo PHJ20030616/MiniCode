@@ -89,6 +89,27 @@ class TestGetAgentLoop:
             assert "glob" in tool_names
             assert "grep" in tool_names
 
+    def test_agent_loop_has_permission_store(self, chat_app: ChatApp) -> None:
+        """AgentLoop 应注入 PermissionStore。"""
+        with patch(
+            "minicode.cli.app.ProviderRegistry.get",
+            return_value=MockProvider("回复"),
+        ):
+            agent_loop = chat_app._get_agent_loop()
+            assert agent_loop.permission_store is not None
+            # 验证 store 指向正确的 workspace
+            assert agent_loop.permission_store._workspace_root == chat_app.workspace_root.resolve()
+
+    def test_agent_loop_has_permission_confirmer(self, chat_app: ChatApp) -> None:
+        """AgentLoop 应注入 PermissionConfirmer。"""
+        with patch(
+            "minicode.cli.app.ProviderRegistry.get",
+            return_value=MockProvider("回复"),
+        ):
+            agent_loop = chat_app._get_agent_loop()
+            assert agent_loop.permission_confirmer is not None
+            assert agent_loop.permission_confirmer.console is chat_app.console
+
 
 @pytest.mark.asyncio
 class TestHandleMessage:

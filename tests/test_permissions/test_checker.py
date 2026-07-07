@@ -446,6 +446,80 @@ class TestWriteFile:
         result = check_permission("write_file", {}, tmp_path)
         assert result.level == PermissionLevel.DENY
 
+    # ------------------------------------------------------------------
+    # append 模式测试
+    # ------------------------------------------------------------------
+
+    def test_append_new_file_caution(self, tmp_path: Path) -> None:
+        """append 模式创建不存在的文件 → CAUTION。"""
+        result = check_permission(
+            "write_file",
+            {"file_path": "new_file.txt", "content": "hello", "mode": "append"},
+            tmp_path,
+        )
+        assert result.level == PermissionLevel.CAUTION
+
+    def test_append_existing_file_caution(self, tmp_path: Path) -> None:
+        """append 模式追加到已有文件 → CAUTION。"""
+        f = tmp_path / "existing.txt"
+        f.write_text("old content")
+
+        result = check_permission(
+            "write_file",
+            {"file_path": "existing.txt", "content": "more", "mode": "append"},
+            tmp_path,
+        )
+        assert result.level == PermissionLevel.CAUTION
+
+    def test_append_sensitive_file_deny(self, tmp_path: Path) -> None:
+        """append 模式写入敏感文件 → DENY。"""
+        result = check_permission(
+            "write_file",
+            {"file_path": ".env", "content": "data", "mode": "append"},
+            tmp_path,
+        )
+        assert result.level == PermissionLevel.DENY
+
+    def test_append_outside_workspace_deny(self, tmp_path: Path) -> None:
+        """append 模式写入 workspace 外 → DENY。"""
+        result = check_permission(
+            "write_file",
+            {"file_path": "/tmp/outside.txt", "content": "data", "mode": "append"},
+            tmp_path,
+        )
+        assert result.level == PermissionLevel.DENY
+
+    def test_append_trust_mode_not_change_caution(self, tmp_path: Path) -> None:
+        """trust_mode 不改变 append 的 CAUTION 等级。"""
+        f = tmp_path / "existing.txt"
+        f.write_text("old")
+
+        result = check_permission(
+            "write_file",
+            {"file_path": "existing.txt", "content": "more", "mode": "append"},
+            tmp_path,
+            trust_mode=True,
+        )
+        assert result.level == PermissionLevel.CAUTION
+
+    def test_overwrite_new_file_caution(self, tmp_path: Path) -> None:
+        """overwrite 模式创建新文件 → CAUTION（显式验证 mode 参数）。"""
+        result = check_permission(
+            "write_file",
+            {"file_path": "new_file.txt", "content": "hello", "mode": "overwrite"},
+            tmp_path,
+        )
+        assert result.level == PermissionLevel.CAUTION
+
+    def test_invalid_mode_deny(self, tmp_path: Path) -> None:
+        """mode 为无效值（如 "delete"）→ DENY。"""
+        result = check_permission(
+            "write_file",
+            {"file_path": "file.txt", "content": "data", "mode": "delete"},
+            tmp_path,
+        )
+        assert result.level == PermissionLevel.DENY
+
 
 class TestEditFile:
     """edit_file 工具权限测试（预留工具）。"""

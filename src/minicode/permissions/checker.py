@@ -354,6 +354,17 @@ def _check_write_file(
             reasons=["file_path 参数缺失或无效"],
         )
 
+    # 提取 mode 参数，默认 "overwrite"
+    mode = arguments.get("mode", "overwrite")
+    if not isinstance(mode, str) or mode not in ("overwrite", "append"):
+        return PermissionDecision(
+            level=PermissionLevel.DENY,
+            tool_name="write_file",
+            operation="写入文件",
+            summary=f"write_file：无效的 mode 参数 '{mode}'",
+            reasons=[f"mode 参数值 '{mode}' 无效，必须为 'overwrite' 或 'append'"],
+        )
+
     target = _resolve_arg_path(file_path, workspace_root)
 
     if not is_within_workspace(target, workspace_root):
@@ -376,21 +387,30 @@ def _check_write_file(
             reasons=[f"{target} 属于敏感文件，不允许写入"],
         )
 
-    # 覆盖已有文件
+    # 根据 mode 和文件是否存在判断权限等级
     if target.exists():
+        if mode == "append":
+            return PermissionDecision(
+                level=PermissionLevel.CAUTION,
+                tool_name="write_file",
+                operation="追加内容",
+                summary=f"write_file：追加内容到已有文件 {target}",
+                target_paths=[target],
+                reasons=[f"追加内容到已有文件 {target}，不破坏原内容"],
+            )
         return PermissionDecision(
             level=PermissionLevel.DANGEROUS,
             tool_name="write_file",
-            operation="写入文件",
+            operation="覆盖文件",
             summary=f"write_file：覆盖已有文件 {target}",
             target_paths=[target],
-            reasons=[f"{target} 已存在，写入将覆盖原内容"],
+            reasons=[f"{target} 已存在，覆盖写入将替换原内容"],
         )
 
     return PermissionDecision(
         level=PermissionLevel.CAUTION,
         tool_name="write_file",
-        operation="写入文件",
+        operation="创建文件",
         summary=f"write_file：创建新文件 {target}",
         target_paths=[target],
         reasons=[f"将在 {target} 创建新文件"],

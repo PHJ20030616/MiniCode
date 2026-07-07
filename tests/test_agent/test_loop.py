@@ -21,7 +21,9 @@ from rich.markdown import Markdown
 from rich.text import Text
 
 from minicode.agent.loop import AgentLoop
+from minicode.cli.confirm import ConfirmerResult
 from minicode.config.models import AgentConfig, AppConfig, PermissionsConfig, ProviderConfig
+from minicode.permissions.models import PermissionDecision
 from minicode.providers.base import (
     BaseProvider,
     FunctionCall,
@@ -641,3 +643,473 @@ async def test_execute_tools_console_print_uses_text_object(
     assert isinstance(text_obj, Text)
     assert text_obj.style == "dim"
     assert "glob" in text_obj.plain
+
+
+# ─── Mock Permission helpers ─────────────────────────────────────────
+
+
+class MockPermissionConfirmer:
+    """Mock PermissionConfirmer 返回预设结果。"""
+
+    def __init__(self, action: str = "allow") -> None:
+        self.action = action
+        self.last_decision: PermissionDecision | None = None
+        self.confirm_count = 0
+
+    async def confirm(self, decision: PermissionDecision) -> ConfirmerResult:
+        self.last_decision = decision
+        self.confirm_count += 1
+        return ConfirmerResult(action=self.action)  # type: ignore[arg-type]
+
+
+class MockPermissionStore:
+    """Mock PermissionStore 返回预设匹配结果。"""
+
+    def __init__(self, has_match: bool = False) -> None:
+        self.has_match = has_match
+        self.added_rules: list[tuple[str, str]] = []
+
+    def find_match(self, tool_name: str, target_paths: list[Path]) -> bool:
+        return self.has_match
+
+    def add_rule(self, tool_name: str, path_pattern: str) -> None:
+        self.added_rules.append((tool_name, path_pattern))
+
+
+# ─── Permission Tests ────────────────────────────────────────────────
+
+
+def _agent_loop_with_permissions(
+    provider: BaseProvider,
+    tool_registry: ToolRegistry,
+    config: AppConfig,
+    tmp_path: Path,
+    store: MockPermissionStore | None = None,
+    confirmer: MockPermissionConfirmer | None = None,
+) -> AgentLoop:
+    """创建带有权限组件的 AgentLoop，用于测试。"""
+    loop = AgentLoop(
+        provider=provider,
+        tool_registry=tool_registry,
+        renderer=MagicRenderer(),
+        config=config,
+        workspace_root=tmp_path,
+        permission_store=store,
+        permission_confirmer=confirmer,
+    )
+    return loop
+
+
+@pytest.mark.asyncio
+async def test_deny_tool_not_executed_adds_rejection(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """DENY 级别工具不执行，追加拒绝 ToolMessage。"""
+    # .env 属于敏感文件 → DENY
+    env_file = tmp_path / ".env"
+    env_file.write_text("SECRET=123", encoding="utf-8")
+
+    provider = MockStepProvider([
+        [
+            StreamChunk(
+                type="tool_call_delta",
+                tool_call=PartialToolCall(
+                    id="call_deny",
+                    index=0,
+                    name="read_file",
+                    arguments='{"file_path": ".env"}',
+                ),
+            ),
+            StreamChunk(type="done", usage=_make_usage(10, 5)),
+        ],
+        # 第二轮：模型应收到拒绝信息并回复
+        [
+            StreamChunk(type="text_delta", text="无法读取敏感文件。"),
+            StreamChunk(type="done", usage=_make_usage(30, 8)),
+        ],
+    ])
+
+    response, loop = await run_agent_loop(
+        provider, create_default_registry(), app_config, "读取 .env", tmp_path
+    )
+
+    assert response is not None
+    # 验证有 ToolMessage 且内容包含"权限拒绝"
+    tool_msgs = [m for m in loop.messages if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    assert "权限拒绝" in (tool_msgs[0].content or "")
+    # 拒绝结果应返回给模型
+    assert "无法读取" in response
+
+
+@pytest.mark.asyncio
+async def test_caution_with_confirmer_deny(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """CAUTION 级别工具被 confirmer 拒绝时不执行。"""
+    confirmer = MockPermissionConfirmer(action="deny")
+
+    provider = MockStepProvider([
+        [
+            StreamChunk(
+                type="tool_call_delta",
+                tool_call=PartialToolCall(
+                    id="call_grep",
+                    index=0,
+                    name="grep",
+                    arguments='{"pattern": "TODO"}',  # 无 glob → CAUTION
+                ),
+            ),
+            StreamChunk(type="done", usage=_make_usage(10, 5)),
+        ],
+        [
+            StreamChunk(type="text_delta", text="用户拒绝了搜索请求。"),
+            StreamChunk(type="done", usage=_make_usage(20, 6)),
+        ],
+    ])
+
+    loop = _agent_loop_with_permissions(
+        provider, create_default_registry(), app_config, tmp_path,
+        confirmer=confirmer,
+    )
+    response = await loop.run("搜索 TODO")
+
+    assert response is not None
+    assert confirmer.confirm_count == 1
+    # 验证有拒绝 ToolMessage
+    tool_msgs = [m for m in loop.messages if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    assert "用户拒绝" in (tool_msgs[0].content or "") or "权限拒绝" in (tool_msgs[0].content or "")
+    assert "拒绝" in response
+
+
+@pytest.mark.asyncio
+async def test_caution_with_confirmer_allow(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """CAUTION 级别工具被 confirmer 允许时正常执行。"""
+    confirmer = MockPermissionConfirmer(action="allow")
+
+    provider = MockStepProvider([
+        [
+            StreamChunk(
+                type="tool_call_delta",
+                tool_call=PartialToolCall(
+                    id="call_grep",
+                    index=0,
+                    name="grep",
+                    arguments='{"pattern": "TODO"}',
+                ),
+            ),
+            StreamChunk(type="done", usage=_make_usage(10, 5)),
+        ],
+        [
+            StreamChunk(type="text_delta", text="搜索已完成。"),
+            StreamChunk(type="done", usage=_make_usage(30, 8)),
+        ],
+    ])
+
+    loop = _agent_loop_with_permissions(
+        provider, create_default_registry(), app_config, tmp_path,
+        confirmer=confirmer,
+    )
+    response = await loop.run("搜索 TODO")
+
+    assert response is not None
+    assert confirmer.confirm_count == 1
+    # 验证工具正常执行（有 ToolMessage 且内容不为拒绝）
+    tool_msgs = [m for m in loop.messages if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    assert "权限拒绝" not in (tool_msgs[0].content or "")
+    assert "用户拒绝" not in (tool_msgs[0].content or "")
+    assert "搜索已完成" in response
+
+
+@pytest.mark.asyncio
+async def test_caution_with_trust_mode_skips_confirmer(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """trust_mode=True 跳过 caution 级别的确认交互。"""
+    app_config.permissions.trust_mode = True
+    confirmer = MockPermissionConfirmer(action="deny")  # 即使 deny，信任模式下不会被调用
+
+    provider = MockStepProvider([
+        [
+            StreamChunk(
+                type="tool_call_delta",
+                tool_call=PartialToolCall(
+                    id="call_grep",
+                    index=0,
+                    name="grep",
+                    arguments='{"pattern": "TODO"}',
+                ),
+            ),
+            StreamChunk(type="done", usage=_make_usage(10, 5)),
+        ],
+        [
+            StreamChunk(type="text_delta", text="搜索已完成。"),
+            StreamChunk(type="done", usage=_make_usage(30, 8)),
+        ],
+    ])
+
+    loop = _agent_loop_with_permissions(
+        provider, create_default_registry(), app_config, tmp_path,
+        confirmer=confirmer,
+    )
+    response = await loop.run("搜索 TODO")
+
+    assert response is not None
+    # 信任模式下 confirmer 不应被调用
+    assert confirmer.confirm_count == 0
+    # 工具正常执行
+    tool_msgs = [m for m in loop.messages if m.role == "tool"]
+    assert len(tool_msgs) == 1
+
+
+@pytest.mark.asyncio
+async def test_caution_with_store_match_skips_confirmer(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """PermissionStore 有匹配规则时跳过 confirmer。"""
+    store = MockPermissionStore(has_match=True)
+    confirmer = MockPermissionConfirmer(action="deny")  # 即使 deny，命中 store 时不会被调用
+
+    provider = MockStepProvider([
+        [
+            StreamChunk(
+                type="tool_call_delta",
+                tool_call=PartialToolCall(
+                    id="call_grep",
+                    index=0,
+                    name="grep",
+                    arguments='{"pattern": "TODO"}',
+                ),
+            ),
+            StreamChunk(type="done", usage=_make_usage(10, 5)),
+        ],
+        [
+            StreamChunk(type="text_delta", text="搜索已完成。"),
+            StreamChunk(type="done", usage=_make_usage(30, 8)),
+        ],
+    ])
+
+    loop = _agent_loop_with_permissions(
+        provider, create_default_registry(), app_config, tmp_path,
+        store=store,
+        confirmer=confirmer,
+    )
+    response = await loop.run("搜索 TODO")
+
+    assert response is not None
+    # store 命中，confirmer 不应被调用
+    assert confirmer.confirm_count == 0
+    # 工具正常执行
+    tool_msgs = [m for m in loop.messages if m.role == "tool"]
+    assert len(tool_msgs) == 1
+
+
+@pytest.mark.asyncio
+async def test_always_allow_adds_rule_to_store(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """用户选择 always allow 时规则写入 store，工具正常执行。"""
+    store = MockPermissionStore()
+    confirmer = MockPermissionConfirmer(action="always_allow")
+
+    provider = MockStepProvider([
+        [
+            StreamChunk(
+                type="tool_call_delta",
+                tool_call=PartialToolCall(
+                    id="call_grep",
+                    index=0,
+                    name="grep",
+                    arguments='{"pattern": "TODO"}',
+                ),
+            ),
+            StreamChunk(type="done", usage=_make_usage(10, 5)),
+        ],
+        [
+            StreamChunk(type="text_delta", text="搜索已完成。"),
+            StreamChunk(type="done", usage=_make_usage(30, 8)),
+        ],
+    ])
+
+    loop = _agent_loop_with_permissions(
+        provider, create_default_registry(), app_config, tmp_path,
+        store=store,
+        confirmer=confirmer,
+    )
+    response = await loop.run("搜索 TODO")
+
+    assert response is not None
+    assert confirmer.confirm_count == 1
+    # 验证规则被添加
+    assert len(store.added_rules) >= 1
+    # 工具正常执行
+    tool_msgs = [m for m in loop.messages if m.role == "tool"]
+    assert len(tool_msgs) == 1
+
+
+@pytest.mark.asyncio
+async def test_safe_tool_bypasses_confirmer(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """SAFE 级别工具不触发 confirmer。"""
+    store = MockPermissionStore()
+    confirmer = MockPermissionConfirmer(action="deny")
+
+    # 创建测试文件
+    (tmp_path / "test.py").write_text("print('hello')", encoding="utf-8")
+
+    provider = MockStepProvider([
+        [
+            StreamChunk(
+                type="tool_call_delta",
+                tool_call=PartialToolCall(
+                    id="call_read",
+                    index=0,
+                    name="read_file",
+                    arguments='{"file_path": "test.py"}',
+                ),
+            ),
+            StreamChunk(type="done", usage=_make_usage(10, 5)),
+        ],
+        [
+            StreamChunk(type="text_delta", text="文件内容已读取。"),
+            StreamChunk(type="done", usage=_make_usage(30, 8)),
+        ],
+    ])
+
+    loop = _agent_loop_with_permissions(
+        provider, create_default_registry(), app_config, tmp_path,
+        store=store,
+        confirmer=confirmer,
+    )
+    response = await loop.run("读取 test.py")
+
+    assert response is not None
+    # SAFE 工具不应触发 confirmer 或 store
+    assert confirmer.confirm_count == 0
+    # 工具正常执行
+    tool_msgs = [m for m in loop.messages if m.role == "tool"]
+    assert len(tool_msgs) == 1
+
+
+@pytest.mark.asyncio
+async def test_deny_in_trust_mode_still_denies(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """trust_mode=True 时 DENY 仍然拒绝。"""
+    app_config.permissions.trust_mode = True
+    env_file = tmp_path / ".env"
+    env_file.write_text("SECRET=123", encoding="utf-8")
+
+    provider = MockStepProvider([
+        [
+            StreamChunk(
+                type="tool_call_delta",
+                tool_call=PartialToolCall(
+                    id="call_deny",
+                    index=0,
+                    name="read_file",
+                    arguments='{"file_path": ".env"}',
+                ),
+            ),
+            StreamChunk(type="done", usage=_make_usage(10, 5)),
+        ],
+        [
+            StreamChunk(type="text_delta", text="无法读取敏感文件。"),
+            StreamChunk(type="done", usage=_make_usage(30, 8)),
+        ],
+    ])
+
+    response, loop = await run_agent_loop(
+        provider, create_default_registry(), app_config, "读取 .env", tmp_path
+    )
+
+    assert response is not None
+    # 验证有拒绝 ToolMessage
+    tool_msgs = [m for m in loop.messages if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    assert "权限拒绝" in (tool_msgs[0].content or "")
+
+
+@pytest.mark.asyncio
+async def test_caution_without_confirmer_rejected(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """CAUTION 级别工具没有 confirmer 时拒绝执行（fail-close）。"""
+    provider = MockStepProvider([
+        [
+            StreamChunk(
+                type="tool_call_delta",
+                tool_call=PartialToolCall(
+                    id="call_grep",
+                    index=0,
+                    name="grep",
+                    arguments='{"pattern": "TODO"}',
+                ),
+            ),
+            StreamChunk(type="done", usage=_make_usage(10, 5)),
+        ],
+        [
+            StreamChunk(type="text_delta", text="已被拒绝。"),
+            StreamChunk(type="done", usage=_make_usage(20, 6)),
+        ],
+    ])
+
+    loop = AgentLoop(
+        provider=provider,
+        tool_registry=create_default_registry(),
+        renderer=MagicRenderer(),
+        config=app_config,
+        workspace_root=tmp_path,
+    )
+    response = await loop.run("搜索 TODO")
+
+    assert response is not None
+    tool_msgs = [m for m in loop.messages if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    assert "权限拒绝" in (tool_msgs[0].content or "")
+    # 确认是拒绝消息而非正常执行结果
+    assert (tool_msgs[0].content or "").startswith("权限拒绝")
+
+
+@pytest.mark.asyncio
+async def test_dangerous_without_confirmer_rejected(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """DANGEROUS 级别工具没有 confirmer 时拒绝执行。"""
+    provider = MockStepProvider([
+        [
+            StreamChunk(
+                type="tool_call_delta",
+                tool_call=PartialToolCall(
+                    id="call_bash",
+                    index=0,
+                    name="bash",
+                    arguments='{"command": "echo hello"}',
+                ),
+            ),
+            StreamChunk(type="done", usage=_make_usage(10, 5)),
+        ],
+        [
+            StreamChunk(type="text_delta", text="命令被拒绝。"),
+            StreamChunk(type="done", usage=_make_usage(20, 6)),
+        ],
+    ])
+
+    loop = AgentLoop(
+        provider=provider,
+        tool_registry=create_default_registry(),
+        renderer=MagicRenderer(),
+        config=app_config,
+        workspace_root=tmp_path,
+    )
+    response = await loop.run("执行命令 echo hello")
+
+    assert response is not None
+    tool_msgs = [m for m in loop.messages if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    assert "权限拒绝" in (tool_msgs[0].content or "")
