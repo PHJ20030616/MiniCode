@@ -134,3 +134,13 @@ def _is_sensitive_file(file_path: Path) -> bool:
     # 检查文件扩展名（如 .pem, .key）
     suffix = resolved.suffix.lower()
     return suffix in SENSITIVE_FILE_PARTS
+
+
+def is_within_workspace(target: Path, workspace_root: Path) -> bool:
+    """公开版：检查目标路径是否在 workspace 范围内。"""
+    return _is_within_workspace(target, workspace_root)
+
+
+def is_sensitive_file(file_path: Path) -> bool:
+    """公开版：检查是否为敏感文件。"""
+    return _is_sensitive_file(file_path)

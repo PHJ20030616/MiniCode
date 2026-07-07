@@ -107,7 +107,7 @@ class ChatApp:
         )
 
         tool_registry = create_default_registry()
-
+        # 创建 AgentLoop
         self._agent_loop = AgentLoop(
             provider=provider,
             tool_registry=tool_registry,
