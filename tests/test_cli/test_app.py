@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -160,6 +161,30 @@ class TestHandleMessage:
             history_len = len(agent_loop.messages)
             await chat_app._handle_message("你好")
             assert len(agent_loop.messages) == history_len  # 已回滚
+
+    async def test_auto_save_skipped_when_run_returns_none(
+        self, chat_app: ChatApp, tmp_path: Path
+    ) -> None:
+        """AgentLoop.run 返回 None 时不应自动创建或更新 session 文件。"""
+        chat_app.workspace_root = tmp_path
+        with patch(
+            "minicode.cli.app.ProviderRegistry.get",
+            return_value=MockProvider("模拟回复"),
+        ):
+            agent_loop = chat_app._get_agent_loop()
+
+            async def none_run(user_input: str) -> str | None:
+                return None  # 模拟 AgentLoop 失败（返回 None）
+
+            agent_loop.run = none_run  # type: ignore[method-assign]
+
+            await chat_app._handle_message("你好")
+
+            # 不应创建 session 文件和 .minicode/sessions 目录
+            sessions_dir = tmp_path / ".minicode" / "sessions"
+            assert not sessions_dir.exists()
+            # auto_save 内部的 try/except 也可能吞掉了错误，
+            # 但既然没有调用 manager.save，磁盘上就不会有文件
 
 
 @pytest.mark.asyncio

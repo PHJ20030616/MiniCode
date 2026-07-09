@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from minicode.cli.renderer import StreamingRenderer
 from minicode.cli.theme import MINICODE_THEME
 from minicode.config.models import AppConfig, ProviderConfig
 from minicode.providers.registry import ProviderRegistry
+from minicode.session import Session, SessionManager
 from minicode.tools import create_default_registry
 from minicode.utils.exceptions import ProviderError
 from minicode.utils.log import get_logger
@@ -32,6 +34,7 @@ class ChatApp:
 
     管理从用户输入到 Agent 回复的完整循环。
     使用 AgentLoop 处理 ReAct 推理与工具调用。
+    每轮对话完成后自动保存会话到磁盘。
     """
 
     def __init__(self, app_config: AppConfig, workspace_root: Path | None = None) -> None:
@@ -41,6 +44,8 @@ class ChatApp:
         self.renderer = StreamingRenderer(self.console)
         self._prompt_session: PromptSession[Any] | None = None
         self._agent_loop: AgentLoop | None = None
+        self._session_manager: SessionManager | None = None
+        self._current_session: Session | None = None
 
     @property
     def session(self) -> PromptSession[Any]:
@@ -127,6 +132,41 @@ class ChatApp:
         )
         return self._agent_loop
 
+    def _get_session_manager(self) -> SessionManager:
+        """获取 SessionManager 实例（懒加载并缓存）。
+
+        Returns:
+            SessionManager 实例。
+        """
+        if self._session_manager is None:
+            from minicode.session import SessionManager
+
+            self._session_manager = SessionManager(self.workspace_root)
+        return self._session_manager
+
+    async def _auto_save(self, agent_loop: AgentLoop) -> None:
+        """Agent Loop 每轮完成后自动保存会话到磁盘。
+
+        使用 fail-soft 策略：记录 debug 日志但不会阻断对话流程。
+
+        Args:
+            agent_loop: 刚完成一轮的 AgentLoop 实例。
+        """
+        try:
+            manager = self._get_session_manager()
+            if self._current_session is None:
+                self._current_session = manager.create(
+                    model=self.config.default_model,
+                    provider=self.config.default_provider,
+                    workspace_root=str(self.workspace_root),
+                )
+            # 同步消息历史到会话（浅拷贝快照）
+            self._current_session.messages = list(agent_loop.messages)
+            self._current_session.updated_at = datetime.now(UTC)
+            manager.save(self._current_session)
+        except Exception as e:
+            logger.debug("自动保存会话失败", error=str(e))
+
     async def _handle_message(self, text: str) -> None:
         """处理一条用户消息。
 
@@ -151,7 +191,9 @@ class ChatApp:
         history_len = len(agent_loop.messages)
 
         try:
-            await agent_loop.run(text)
+            result = await agent_loop.run(text)
+            if result is not None:
+                await self._auto_save(agent_loop)
         except ProviderError as e:
             # 回滚本次用户消息
             del agent_loop.messages[history_len:]
