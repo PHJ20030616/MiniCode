@@ -8,6 +8,7 @@ import typer
 
 from minicode import __version__
 from minicode.cli.app import ChatApp
+from minicode.commands import register_all_commands
 from minicode.config.loader import load
 from minicode.utils.exceptions import ConfigError, MiniCodeError
 from minicode.utils.log import get_logger, setup_logging
@@ -118,6 +119,9 @@ def main(
             default_provider=app_config.default_provider,
             default_model=app_config.default_model,
         )
+
+        # 注册所有斜杠命令（在创建 ChatApp 之前，避免重复注册）
+        register_all_commands()
 
         # 进入对话模式
         asyncio.run(ChatApp(app_config, workspace_root=workspace_path).run())

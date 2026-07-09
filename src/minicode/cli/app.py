@@ -19,6 +19,8 @@ from rich.console import Console
 from minicode.agent import AgentLoop
 from minicode.cli.renderer import StreamingRenderer
 from minicode.cli.theme import MINICODE_THEME
+from minicode.commands.base import CommandContext
+from minicode.commands.registry import CommandRegistry
 from minicode.config.models import AppConfig, ProviderConfig
 from minicode.providers.registry import ProviderRegistry
 from minicode.session import Session, SessionManager
@@ -70,14 +72,12 @@ class ChatApp:
                 if not user_input:
                     continue
 
-                if user_input.lower() in ("exit", "quit", "/exit", "/quit"):
-                    self.renderer.show_info("再见！")
+                should_exit = await self._handle_input(user_input)
+                if should_exit:
                     break
 
-                await self._handle_message(user_input)
-
             except (KeyboardInterrupt, EOFError):
-                self.renderer.show_info("\n再见！")
+                self.renderer.show_info("再见！")
                 break
 
     def _get_agent_loop(self) -> AgentLoop:
@@ -202,3 +202,176 @@ class ChatApp:
             del agent_loop.messages[history_len:]
             self.renderer.show_error(f"发生未知错误：{e}")
             logger.debug("AgentLoop 处理异常", exc_info=True)
+
+    async def _clear_and_new_session(self) -> None:
+        """清空当前 AgentLoop 消息并创建新会话。
+
+        由 /clear 命令调用，也用于 /session delete 删除当前会话时。
+        旧会话已在 _auto_save 中保存，此处仅清理上下文和创建新会话。
+        """
+        agent_loop = self._agent_loop
+        # 清空现有消息历史，AgentLoop 会在下一轮自动注入 system prompt
+        if agent_loop is not None:
+            agent_loop.messages.clear()
+
+        # 创建新会话
+        manager = self._get_session_manager()
+        self._current_session = manager.create(
+            model=self.config.default_model,
+            provider=self.config.default_provider,
+            workspace_root=str(self.workspace_root),
+        )
+        logger.debug(
+            "已创建新会话",
+            session_id=self._current_session.id,
+            reason="clear_command",
+        )
+
+    async def switch_session(self, session_id: str) -> bool:
+        """切换到指定会话。
+
+        保存当前会话后，加载目标会话并替换 AgentLoop 的消息历史。
+
+        Args:
+            session_id: 目标会话 ID。
+
+        Returns:
+            True 表示切换成功，False 表示失败。
+        """
+        manager = self._get_session_manager()
+
+        # 保存当前会话
+        if self._current_session is not None and self._agent_loop is not None:
+            self._current_session.messages = list(self._agent_loop.messages)
+            manager.save(self._current_session)
+
+        # 加载目标会话
+        target = manager.load(session_id)
+        if target is None:
+            return False
+
+        # 替换 AgentLoop 消息
+        agent_loop = self._get_agent_loop()
+        agent_loop.messages.clear()
+        agent_loop.messages.extend(target.messages)
+
+        # 更新当前会话引用
+        self._current_session = target
+
+        logger.debug(
+            "已切换会话",
+            session_id=session_id,
+            message_count=target.message_count,
+        )
+        return True
+
+    async def _handle_input(self, text: str) -> bool:
+        """处理用户输入，路由到命令或 AgentLoop。
+
+        Args:
+            text: 用户输入文本。
+
+        Returns:
+            True 表示应退出程序。
+        """
+        # 向后兼容：保留直接输入 exit/quit 的能力（无斜杠前缀）
+        if text.lower() in ("exit", "quit"):
+            self.renderer.show_info("再见！")
+            return True
+
+        if text.startswith("/"):
+            return await self._handle_command(text)
+        else:
+            await self._handle_message(text)
+            return False
+
+    async def _handle_command(self, text: str) -> bool:
+        """处理斜杠命令。
+
+        1. 解析命令名和参数
+        2. 查找命令
+        3. 构建 CommandContext
+        4. 执行命令
+        5. 处理结果
+
+        Args:
+            text: 完整的命令文本（含 '/' 前缀）。
+
+        Returns:
+            True 表示应退出程序（/quit 命令）。
+        """
+        # 解析命令名和参数
+        cmd_text = text[1:]  # 去掉 '/' 前缀
+        if not cmd_text:
+            self.renderer.show_error("请输入命令名，输入 /help 查看可用命令。")
+            return False
+
+        parts = cmd_text.split(maxsplit=1)
+        cmd_name = parts[0].lower()
+        cmd_args = parts[1] if len(parts) > 1 else ""
+
+        # 向后兼容：保留直接输入 exit/quit 的能力
+        if cmd_name in ("exit", "quit", "q"):
+            self.renderer.show_info("再见！")
+            return True
+
+        # 查找命令
+        command = CommandRegistry.find(cmd_name)
+        if command is None:
+            self.renderer.show_error(
+                f"未知命令：/{cmd_name}。输入 /help 查看可用命令。"
+            )
+            return False
+
+        # 构建上下文
+        ctx = self._build_command_context()
+
+        # 执行命令
+        try:
+            result = await command.execute(cmd_args, ctx)
+        except Exception as e:
+            logger.debug("命令执行异常", command=cmd_name, error=str(e), exc_info=True)
+            self.renderer.show_error(f"命令执行失败：{e}")
+            return False
+
+        # 处理结果
+        if result.message:
+            if result.success:
+                self.renderer.show_info(result.message)
+            else:
+                self.renderer.show_error(result.message)
+
+        return result.should_exit
+
+    def _build_command_context(self) -> CommandContext:
+        """构建命令执行上下文。
+
+        Returns:
+            CommandContext 实例，包含所有命令需要的依赖。
+        """
+        return CommandContext(
+            app_config=self.config,
+            workspace_root=self.workspace_root,
+            session_manager=self._get_session_manager(),
+            agent_loop=self._agent_loop,  # 可能为 None（首次对话前）
+            renderer=self.renderer,
+            console=self.console,
+            # 注入会话生命周期回调，保持 ChatApp._current_session 与命令操作同步
+            notify_session_created=self._on_session_created,
+            notify_session_switched=self._on_session_switched,
+            notify_session_deleted=self._on_session_deleted,
+        )
+
+    async def _on_session_created(self, session: Any) -> None:
+        """/clear 创建新会话后的回调，更新 _current_session。"""
+        self._current_session = session
+
+    async def _on_session_switched(self, session: Any) -> None:
+        """/session switch 切换会话后的回调，更新 _current_session。"""
+        self._current_session = session
+
+    async def _on_session_deleted(self, session_id: str) -> None:
+        """/session delete 删除会话后的回调。若删除的是当前活跃会话，自动创建新会话。"""
+        if self._current_session is not None and self._current_session.id == session_id:
+            # 当前会话被删除，重置到新会话
+            await self._clear_and_new_session()

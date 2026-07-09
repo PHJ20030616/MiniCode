@@ -346,11 +346,13 @@ uv add --dev pytest pytest-asyncio pytest-mock pytest-cov mypy ruff
 #### Task 5.1 — 会话模型与存储
 
 **要求：**
+
 - 实现 `Session`、`SessionManager`。
 - 保存完整 messages，包括 tool calls 和 tool results。
 - 存储到 `.minicode/sessions/`。
 
 **验收标准：**
+
 - 单测覆盖 create/save/load/list/delete。
 - 自动保存发生在每轮 Agent Loop 完成后。
 - 集成测试覆盖：Agent Loop 完成后保存会话，再加载会话继续追加一轮消息。
@@ -376,7 +378,7 @@ uv add --dev pytest pytest-asyncio pytest-mock pytest-cov mypy ruff
 1. `/quit`、`/exit`、`/q`
 2. `/help`
 3. `/clear`
-4. `/session list|switch|delete`
+4. `/session list|switch|delete`（备注：输入/session时会先列出前5条最近的历史会话，用户可以通过键盘的方向键进行选择并且可以不断按方向键“下”进行选择，直到选择到最后一个保存的历史会话返回最近的会话，选中后按enter加载对应会话的上下文）
 5. `/config show`
 
 **验收标准：**

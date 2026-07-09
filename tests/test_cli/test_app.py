@@ -231,3 +231,70 @@ class TestAppRun:
         mock_session.prompt_async = AsyncMock(side_effect=EOFError)
         chat_app._prompt_session = mock_session
         await chat_app.run()
+
+
+@pytest.mark.asyncio
+class TestCommandRouting:
+    """命令路由集成测试。"""
+
+    async def test_slash_quit_exits(self, chat_app: ChatApp) -> None:
+        """/quit 命令应返回 True（退出）。"""
+        should_exit = await chat_app._handle_input("/quit")
+        assert should_exit is True
+
+    async def test_slash_exit_exits(self, chat_app: ChatApp) -> None:
+        """/exit 命令也应退出。"""
+        should_exit = await chat_app._handle_input("/exit")
+        assert should_exit is True
+
+    async def test_slash_q_exits(self, chat_app: ChatApp) -> None:
+        """/q 命令也应退出。"""
+        should_exit = await chat_app._handle_input("/q")
+        assert should_exit is True
+
+    async def test_slash_help_does_not_exit(self, chat_app: ChatApp) -> None:
+        """/help 不应触发退出。"""
+        from minicode.commands.help_cmd import HelpCommand
+        from minicode.commands.registry import CommandRegistry
+
+        CommandRegistry._commands.clear()
+        CommandRegistry._aliases.clear()
+        CommandRegistry.register(HelpCommand())
+
+        should_exit = await chat_app._handle_input("/help")
+        assert should_exit is False
+
+    async def test_slash_config_show(self, chat_app: ChatApp) -> None:
+        """/config show 应正常执行。"""
+        from minicode.commands.config_cmd import ConfigCommand
+        from minicode.commands.registry import CommandRegistry
+
+        CommandRegistry._commands.clear()
+        CommandRegistry._aliases.clear()
+        CommandRegistry.register(ConfigCommand())
+
+        should_exit = await chat_app._handle_input("/config")
+        assert should_exit is False
+
+    async def test_unknown_command_shows_error(self, chat_app: ChatApp) -> None:
+        """未知命令应显示错误但不退出。"""
+        should_exit = await chat_app._handle_input("/nonexistent_cmd_xyz")
+        assert should_exit is False
+
+    async def test_normal_text_delegates_to_agent(self, chat_app: ChatApp) -> None:
+        """普通文本输入应委托给 AgentLoop。"""
+        with patch(
+            "minicode.cli.app.ProviderRegistry.get",
+            return_value=MockProvider("模拟回复"),
+        ):
+            agent_loop = chat_app._get_agent_loop()
+            agent_loop.run = AsyncMock()  # type: ignore[method-assign]
+
+            should_exit = await chat_app._handle_input("你好")
+            assert should_exit is False
+            agent_loop.run.assert_called_once_with("你好")
+
+    async def test_slash_only_shows_error(self, chat_app: ChatApp) -> None:
+        """仅输入 '/' 应显示友好错误，不应崩溃。"""
+        should_exit = await chat_app._handle_input("/")
+        assert should_exit is False
