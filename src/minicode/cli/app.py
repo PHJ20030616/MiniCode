@@ -17,6 +17,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
 
 from minicode.agent import AgentLoop
+from minicode.cli.completer import CommandCompleter
 from minicode.cli.renderer import StreamingRenderer
 from minicode.cli.theme import MINICODE_THEME
 from minicode.commands.base import CommandContext
@@ -52,9 +53,13 @@ class ChatApp:
 
     @property
     def session(self) -> PromptSession[Any]:
-        """延迟初始化的 PromptSession。"""
+        """延迟初始化的 PromptSession，带有命令自动补全。"""
         if self._prompt_session is None:
-            self._prompt_session = PromptSession()
+            completer = CommandCompleter(CommandRegistry)
+            self._prompt_session = PromptSession(
+                completer=completer,
+                complete_while_typing=True,
+            )
         return self._prompt_session
 
     async def run(self) -> None:
