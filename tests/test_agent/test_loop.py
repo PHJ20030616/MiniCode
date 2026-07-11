@@ -35,6 +35,7 @@ from minicode.providers.base import (
 )
 from minicode.tools import create_default_registry
 from minicode.tools.registry import ToolRegistry
+from minicode.utils.exceptions import ProviderError
 
 # ─── Mock Provider ─────────────────────────────────────────────────
 
@@ -1336,3 +1337,67 @@ async def test_reload_memory_disabled_no_content(
     assert "secret-memory" not in loop.system_prompt
     assert "不应出现" not in loop.system_prompt
     assert "用户记忆" not in loop.system_prompt
+
+
+# ─── Test: ProviderError 处理 ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_provider_error_rolls_back_and_returns_none(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """ProviderError 应回滚用户消息并返回 None。"""
+    class FailingProvider(BaseProvider):
+        @property
+        def name(self) -> str:
+            return "failing"
+
+        async def chat(
+            self, messages: list[Message], tools: list[dict] | None = None,
+            stream: bool = True, max_tokens: int | None = None,
+        ) -> AsyncIterator[StreamChunk]:
+            # 直接抛出 ProviderError，模拟 chat() 中重试耗尽后的行为
+            raise ProviderError("模拟 Provider 错误")
+
+        async def list_models(self) -> list[str]:
+            return []
+
+    provider = FailingProvider()
+    response, loop = await run_agent_loop(
+        provider, create_default_registry(), app_config, "测试错误", tmp_path
+    )
+
+    assert response is None
+    # 用户消息应被回滚
+    assert len(loop.messages) == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_error_chunk_handling(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """流式 error chunk 应回滚用户消息。"""
+    class ErrorChunkProvider(BaseProvider):
+        @property
+        def name(self) -> str:
+            return "error-chunk"
+
+        async def chat(
+            self, messages: list[Message], tools: list[dict] | None = None,
+            stream: bool = True, max_tokens: int | None = None,
+        ) -> AsyncIterator[StreamChunk]:
+            yield StreamChunk(
+                type="error",
+                text="请求在 3 次重试后仍然失败：API 超时",
+            )
+
+        async def list_models(self) -> list[str]:
+            return []
+
+    provider = ErrorChunkProvider()
+    response, loop = await run_agent_loop(
+        provider, create_default_registry(), app_config, "测试错误", tmp_path
+    )
+
+    assert response is None
+    assert len(loop.messages) == 0  # 用户消息回滚

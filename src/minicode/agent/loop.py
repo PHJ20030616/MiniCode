@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 from collections import defaultdict
 from pathlib import Path
@@ -30,6 +31,7 @@ from minicode.providers.base import (
     ToolMessage,
     UsageInfo,
 )
+from minicode.utils.exceptions import ProviderError
 from minicode.utils.log import get_logger
 
 if TYPE_CHECKING:
@@ -151,15 +153,30 @@ class AgentLoop:
                     if t.get("function", {}).get("name") != "remember"
                 ]
 
-            stream = self.provider.chat(
-                messages=api_messages,
-                tools=tools_schema,
-                stream=self.config.agent.stream,
-                max_tokens=self.config.max_tokens,
-            )
+            try:
+                stream = self.provider.chat(
+                    messages=api_messages,
+                    tools=tools_schema,
+                    stream=self.config.agent.stream,
+                    max_tokens=self.config.max_tokens,
+                )
+                # 兼容 chat() 直接返回协程并抛出 ProviderError 的场景
+                if inspect.iscoroutine(stream):
+                    stream = await stream
+            except ProviderError as e:
+                logger.debug("Provider 调用失败", round=round_num, error=str(e))
+                self.renderer.show_error(f"{e}")
+                self.messages.pop()  # 回滚用户消息
+                return None
 
             # 处理流式响应：渲染文本 + 收集 tool_call
-            text_content, tool_calls, usage = await self._process_stream(stream)
+            try:
+                text_content, tool_calls, usage = await self._process_stream(stream)
+            except ProviderError as e:
+                logger.debug("Provider 流式处理失败", round=round_num, error=str(e))
+                self.renderer.show_error(f"{e}")
+                self.messages.pop()  # 回滚用户消息
+                return None
 
             # 如果流式处理中发生错误
             if text_content is None and tool_calls is None:
@@ -372,7 +389,8 @@ class AgentLoop:
             if result.success:
                 self.renderer.show_info(f"工具执行成功（{len(result.output)} 字符）")
             else:
-                self.renderer.show_error(f"工具执行失败：{result.error or result.output}")
+                error_detail = result.error or result.output
+                self.renderer.show_error(f"工具执行失败：{name} — {error_detail[:200]}")
 
             # remember 工具成功执行后刷新系统提示词
             if name == "remember" and result.success and self._memory_enabled:
