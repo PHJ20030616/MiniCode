@@ -135,6 +135,7 @@ class AgentLoop:
         Returns:
             最终回复文本。若过程中出现无法恢复的错误则返回 None。
         """
+        history_len = len(self.messages)  # 记录初始长度，用于错误回滚
         self.messages.append(Message(role="user", content=user_input))
         logger.debug("AgentLoop 开始", max_rounds=self.config.agent.max_rounds)
 
@@ -166,7 +167,7 @@ class AgentLoop:
             except ProviderError as e:
                 logger.debug("Provider 调用失败", round=round_num, error=str(e))
                 self.renderer.show_error(f"{e}")
-                self.messages.pop()  # 回滚用户消息
+                del self.messages[history_len:]  # 回滚本轮所有消息
                 return None
 
             # 处理流式响应：渲染文本 + 收集 tool_call
@@ -175,12 +176,12 @@ class AgentLoop:
             except ProviderError as e:
                 logger.debug("Provider 流式处理失败", round=round_num, error=str(e))
                 self.renderer.show_error(f"{e}")
-                self.messages.pop()  # 回滚用户消息
+                del self.messages[history_len:]  # 回滚本轮所有消息
                 return None
 
             # 如果流式处理中发生错误
             if text_content is None and tool_calls is None:
-                self.messages.pop()  # 回滚用户消息
+                del self.messages[history_len:]  # 回滚本轮所有消息
                 return None
 
             # 构建 assistant 消息并追加到历史

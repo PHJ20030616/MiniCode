@@ -265,6 +265,48 @@ class TestAppRun:
         chat_app._agent_loop = None
         await chat_app._shutdown_gracefully()  # 不应抛异常
 
+    async def test_normal_exit_saves_session(
+        self, chat_app: ChatApp, mock_stdout: MagicMock
+    ) -> None:
+        """正常 exit 退出应保存当前会话。"""
+        # 创建 AgentLoop 并填充消息
+        with patch("minicode.cli.app.ProviderRegistry.get", return_value=MockProvider("ok")):
+            agent_loop = chat_app._get_agent_loop()
+            agent_loop.messages.append(Message(role="user", content="你好"))
+            agent_loop.messages.append(Message(role="assistant", content="回复"))
+
+        # 创建当前会话
+        session_manager = chat_app._get_session_manager()
+        chat_app._current_session = session_manager.create(
+            model="test", provider="test", workspace_root="/tmp"
+        )
+
+        # 模拟用户输入 exit
+        mock_session = AsyncMock(spec=["prompt_async"])
+        mock_session.prompt_async = AsyncMock(return_value="exit")
+        chat_app._prompt_session = mock_session
+
+        original_shutdown = chat_app._shutdown_gracefully
+        shutdown_called = False
+
+        async def tracking_shutdown() -> None:
+            nonlocal shutdown_called
+            shutdown_called = True
+            await original_shutdown()
+
+        chat_app._shutdown_gracefully = tracking_shutdown  # type: ignore[method-assign]
+
+        await chat_app.run()
+
+        assert shutdown_called, "_shutdown_gracefully 应被调用"
+        # 会话应包含 AgentLoop 的消息
+        assert chat_app._current_session is not None
+        assert len(chat_app._current_session.messages) == 2
+        # 磁盘上也应有保存的文件
+        saved = session_manager.load(chat_app._current_session.id)
+        assert saved is not None
+        assert len(saved.messages) == 2
+
 
 @pytest.mark.asyncio
 class TestCommandRouting:

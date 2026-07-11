@@ -90,6 +90,7 @@ class ChatApp:
 
                 should_exit = await self._handle_input(user_input)
                 if should_exit:
+                    await self._shutdown_gracefully()
                     break
 
             except (KeyboardInterrupt, EOFError):
@@ -309,7 +310,6 @@ class ChatApp:
         """
         # 向后兼容：保留直接输入 exit/quit 的能力（无斜杠前缀）
         if text.lower() in ("exit", "quit"):
-            self.renderer.show_info("再见！")
             return True
 
         if text.startswith("/"):
@@ -345,7 +345,6 @@ class ChatApp:
 
         # 向后兼容：保留直接输入 exit/quit 的能力
         if cmd_name in ("exit", "quit", "q"):
-            self.renderer.show_info("再见！")
             return True
 
         # 查找命令

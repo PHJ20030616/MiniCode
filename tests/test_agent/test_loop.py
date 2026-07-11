@@ -1401,3 +1401,123 @@ async def test_stream_error_chunk_handling(
 
     assert response is None
     assert len(loop.messages) == 0  # 用户消息回滚
+
+
+# ─── Test: 第二轮失败回滚 ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_second_round_error_chunk_rolls_back_all(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """第一轮工具调用成功执行，第二轮流式 error chunk 应回滚本轮所有消息。"""
+    provider = MockStepProvider([
+        # 第一轮：工具调用（glob 会成功执行）
+        [
+            StreamChunk(
+                type="tool_call_delta",
+                tool_call=PartialToolCall(
+                    id="call_g", index=0, name="glob",
+                    arguments='{"pattern": "*.py"}',
+                ),
+            ),
+            StreamChunk(type="done", usage=_make_usage(10, 5)),
+        ],
+        # 第二轮：流式错误（模拟 provider 临时故障）
+        [
+            StreamChunk(type="error", text="API 临时不可用"),
+        ],
+    ])
+
+    loop = AgentLoop(
+        provider=provider,
+        tool_registry=create_default_registry(),
+        renderer=MagicRenderer(),
+        config=app_config,
+        workspace_root=tmp_path,
+    )
+    history_len = len(loop.messages)  # 0
+    response = await loop.run("查找文件")
+
+    assert response is None
+    # 应完整回滚：用户消息 + 第一轮 assistant(tool_call) + tool(result) 全部清空
+    assert len(loop.messages) == history_len
+
+
+@pytest.mark.asyncio
+async def test_second_round_provider_error_rolls_back_all(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """第一轮工具调用成功执行，第二轮 ProviderError 应回滚本轮所有消息。"""
+    call_count = 0
+
+    class SecondRoundFailsProvider(BaseProvider):
+        @property
+        def name(self) -> str:
+            return "second-round-fails"
+
+        async def chat(
+            self, messages: list[Message], tools: list[dict] | None = None,
+            stream: bool = True, max_tokens: int | None = None,
+        ) -> AsyncIterator[StreamChunk]:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                yield StreamChunk(
+                    type="tool_call_delta",
+                    tool_call=PartialToolCall(
+                        id="c1", index=0, name="glob",
+                        arguments='{"pattern": "*.py"}',
+                    ),
+                )
+                yield StreamChunk(type="done", usage=_make_usage(10, 5))
+            else:
+                raise ProviderError("模拟 Provider 错误")
+
+        async def list_models(self) -> list[str]:
+            return []
+
+    loop = AgentLoop(
+        provider=SecondRoundFailsProvider(),
+        tool_registry=create_default_registry(),
+        renderer=MagicRenderer(),
+        config=app_config,
+        workspace_root=tmp_path,
+    )
+    history_len = len(loop.messages)  # 0
+    response = await loop.run("查找文件")
+
+    assert response is None
+    # 应完整回滚所有消息
+    assert len(loop.messages) == history_len
+
+
+@pytest.mark.asyncio
+async def test_with_existing_history_rollback_restores_original(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """已有对话历史的 loop，错误应回滚到历史长度而非完全清空。"""
+    loop = AgentLoop(
+        provider=MockStepProvider([]),
+        tool_registry=create_default_registry(),
+        renderer=MagicRenderer(),
+        config=app_config,
+        workspace_root=tmp_path,
+    )
+    # 模拟已有对话历史
+    loop.messages.append(Message(role="user", content="之前的对话"))
+    loop.messages.append(Message(role="assistant", content="之前的回复"))
+    history_len = len(loop.messages)  # 2
+
+    # 新的 provider 会直接报错
+    provider = MockStepProvider([
+        [StreamChunk(type="error", text="错误")],
+    ])
+    loop.provider = provider
+    response = await loop.run("新消息")
+
+    assert response is None
+    # 历史消息应保留，仅回滚本次添加的消息
+    assert len(loop.messages) == history_len
+    assert loop.messages[0].content == "之前的对话"
+    assert loop.messages[1].content == "之前的回复"
