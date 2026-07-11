@@ -5,15 +5,11 @@
 
 from __future__ import annotations
 
-import asyncio
-from typing import Any
-
 import openai
 import pytest
 
 from minicode.utils.exceptions import RetryExhaustedError
 from minicode.utils.retry import RetryConfig, async_retry, is_retryable
-
 
 # ─── is_retryable 测试 ────────────────────────────────────────
 
@@ -37,20 +33,36 @@ class TestIsRetryable:
         assert is_retryable(openai.APIConnectionError(message="refused", request=request)) is True
 
     def test_rate_limit_is_retryable(self) -> None:
-        response = type("MockResponse", (), {"status_code": 429, "headers": {}, "request": MockRequest()})()
-        assert is_retryable(openai.RateLimitError("ratelimit", response=response, body=None)) is True
+        response = type(
+            "MockResponse",
+            (),
+            {"status_code": 429, "headers": {}, "request": MockRequest()},
+        )()
+        assert is_retryable(openai.RateLimitError("ratelimit", response=response, body=None))
 
     def test_server_error_is_retryable(self) -> None:
-        response = type("MockResponse", (), {"status_code": 500, "headers": {}, "request": MockRequest()})()
-        assert is_retryable(openai.InternalServerError("500", response=response, body=None)) is True
+        response = type(
+            "MockResponse",
+            (),
+            {"status_code": 500, "headers": {}, "request": MockRequest()},
+        )()
+        assert is_retryable(openai.InternalServerError("500", response=response, body=None))
 
     def test_auth_error_not_retryable(self) -> None:
-        response = type("MockResponse", (), {"status_code": 401, "headers": {}, "request": MockRequest()})()
-        assert is_retryable(openai.AuthenticationError("401", response=response, body=None)) is False
+        response = type(
+            "MockResponse",
+            (),
+            {"status_code": 401, "headers": {}, "request": MockRequest()},
+        )()
+        assert not is_retryable(openai.AuthenticationError("401", response=response, body=None))
 
     def test_bad_request_not_retryable(self) -> None:
-        response = type("MockResponse", (), {"status_code": 400, "headers": {}, "request": MockRequest()})()
-        assert is_retryable(openai.APIStatusError("400", response=response, body=None)) is False
+        response = type(
+            "MockResponse",
+            (),
+            {"status_code": 400, "headers": {}, "request": MockRequest()},
+        )()
+        assert not is_retryable(openai.APIStatusError("400", response=response, body=None))
 
     def test_not_openai_error_not_retryable(self) -> None:
         assert is_retryable(ValueError("not openai")) is False
@@ -113,7 +125,11 @@ class TestAsyncRetry:
         async def auth_fail() -> str:
             nonlocal call_count
             call_count += 1
-            response = type("MockResponse", (), {"status_code": 401, "headers": {}, "request": MockRequest()})()
+            response = type(
+                "MockResponse",
+                (),
+                {"status_code": 401, "headers": {}, "request": MockRequest()},
+            )()
             raise openai.AuthenticationError("bad key", response=response, body=None)
 
         with pytest.raises(openai.AuthenticationError):

@@ -656,7 +656,8 @@ class TestErrorHandling:
         )
 
         provider = make_provider()
-        chunks = [chunk async for chunk in provider.chat(messages=[Message(role="user", content="Hi")])]
+        msg = Message(role="user", content="Hi")
+        chunks = [chunk async for chunk in provider.chat(messages=[msg])]
 
         error_chunks = [c for c in chunks if c.type == "error"]
         assert len(error_chunks) == 1
@@ -671,7 +672,8 @@ class TestErrorHandling:
         )
 
         provider = make_provider()
-        chunks = [chunk async for chunk in provider.chat(messages=[Message(role="user", content="Hi")])]
+        msg = Message(role="user", content="Hi")
+        chunks = [chunk async for chunk in provider.chat(messages=[msg])]
 
         error_chunks = [c for c in chunks if c.type == "error"]
         assert len(error_chunks) == 1
@@ -684,7 +686,8 @@ class TestErrorHandling:
         )
 
         provider = make_provider()
-        chunks = [chunk async for chunk in provider.chat(messages=[Message(role="user", content="Hi")])]
+        msg = Message(role="user", content="Hi")
+        chunks = [chunk async for chunk in provider.chat(messages=[msg])]
 
         error_chunks = [c for c in chunks if c.type == "error"]
         assert len(error_chunks) == 1
@@ -708,7 +711,8 @@ class TestErrorHandling:
         )
 
         provider = make_provider()
-        chunks = [chunk async for chunk in provider.chat(messages=[Message(role="user", content="Hi")])]
+        msg = Message(role="user", content="Hi")
+        chunks = [chunk async for chunk in provider.chat(messages=[msg])]
 
         error_chunks = [c for c in chunks if c.type == "error"]
         assert len(error_chunks) == 1
@@ -741,14 +745,21 @@ class TestRetryIntegration:
             if call_count < 3:
                 raise openai.APITimeoutError("timeout")
             return async_gen(
-                MockChunk(choices=[MockChoice(delta=MockDelta(content="最终回复"))], model="test-model"),
-                MockChunk(choices=[MockChoice(delta=MockDelta(), finish_reason="stop")], model="test-model"),
+                MockChunk(
+                    choices=[MockChoice(delta=MockDelta(content="最终回复"))],
+                    model="test-model",
+                ),
+                MockChunk(
+                    choices=[MockChoice(delta=MockDelta(), finish_reason="stop")],
+                    model="test-model",
+                ),
             )
 
         mock_client.chat.completions.create = fail_then_ok  # type: ignore[method-assign]
 
         provider = make_provider()
-        chunks = [chunk async for chunk in provider.chat(messages=[Message(role="user", content="你好")])]
+        msg = Message(role="user", content="你好")
+        chunks = [chunk async for chunk in provider.chat(messages=[msg])]
 
         assert call_count == 3
         assert any(c.text == "最终回复" for c in chunks if c.type == "text_delta")
@@ -758,7 +769,8 @@ class TestRetryIntegration:
         mock_client.chat.completions.create.side_effect = openai.APITimeoutError("always timeout")
 
         provider = make_provider()
-        chunks = [chunk async for chunk in provider.chat(messages=[Message(role="user", content="你好")])]
+        msg = Message(role="user", content="你好")
+        chunks = [chunk async for chunk in provider.chat(messages=[msg])]
 
         # 应至少有一个 error chunk
         error_chunks = [c for c in chunks if c.type == "error"]
@@ -770,8 +782,9 @@ class TestRetryIntegration:
         mock_client.chat.completions.create.side_effect = openai.APITimeoutError("timeout")
 
         provider = make_provider()
+        msg = Message(role="user", content="你好")
         with pytest.raises(ProviderError, match="重试"):
-            async for _ in provider.chat(messages=[Message(role="user", content="你好")], stream=False):
+            async for _ in provider.chat(messages=[msg], stream=False):
                 pass
 
     async def test_auth_error_not_retried(self, mock_client: Any) -> None:
@@ -781,7 +794,11 @@ class TestRetryIntegration:
         async def auth_fail(**kwargs: Any) -> Any:
             nonlocal call_count
             call_count += 1
-            response = type("MockResponse", (), {"status_code": 401, "headers": {}, "request": MockRequest()})()
+            response = type(
+                "MockResponse",
+                (),
+                {"status_code": 401, "headers": {}, "request": MockRequest()},
+            )()
             raise openai.AuthenticationError("bad key", response=response, body=None)
 
         mock_client.chat.completions.create = auth_fail  # type: ignore[method-assign]

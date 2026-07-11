@@ -11,14 +11,11 @@ from __future__ import annotations
 import asyncio
 import random
 from collections.abc import Awaitable, Callable
-from typing import TypeVar
 
 import openai
 from pydantic import BaseModel
 
 from minicode.utils.exceptions import RetryExhaustedError
-
-T = TypeVar("T")
 
 
 class RetryConfig(BaseModel):
@@ -50,14 +47,18 @@ def is_retryable(error: Exception) -> bool:
     - APIStatusError（400/403/404 等）：客户端请求错误
     - 其他非 openai 异常
     """
-    if isinstance(error, (openai.APITimeoutError, openai.APIConnectionError)):
-        return True
-    if isinstance(error, (openai.RateLimitError, openai.InternalServerError)):
-        return True
-    return False
+    return isinstance(
+        error,
+        (
+            openai.APITimeoutError,
+            openai.APIConnectionError,
+            openai.RateLimitError,
+            openai.InternalServerError,
+        ),
+    )
 
 
-async def async_retry(
+async def async_retry[T](
     fn: Callable[..., Awaitable[T]],
     *args: object,
     config: RetryConfig | None = None,

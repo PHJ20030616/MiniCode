@@ -59,6 +59,7 @@ class OpenAICompatibleProvider(BaseProvider):
         """
         self._model = model
         self._provider_name = provider_name
+        self._timeout = timeout
         self._client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
@@ -98,7 +99,7 @@ class OpenAICompatibleProvider(BaseProvider):
                 raise ProviderError(error_msg) from None
         except openai.APITimeoutError:
             raise ProviderError(
-                f"请求超时（{self._client._timeout}s）。"
+                f"请求超时（{self._timeout}s）。"
                 "请检查网络连接或增加超时时间。"
             ) from None
         except openai.APIConnectionError:
@@ -186,7 +187,7 @@ class OpenAICompatibleProvider(BaseProvider):
         )
         finished = False
 
-        async for chunk in stream:
+        async for chunk in stream:  # type: ignore[attr-defined]
             # choices=[] + usage：stream_options 模式的最终 usage chunk
             if not chunk.choices:
                 if chunk.usage and not finished:
@@ -254,8 +255,8 @@ class OpenAICompatibleProvider(BaseProvider):
                     tool_call=PartialToolCall(
                         id=tc.id,
                         index=idx,
-                        name=tc.function.name,
-                        arguments=tc.function.arguments,
+                        name=tc.function.name,  # type: ignore[union-attr]
+                        arguments=tc.function.arguments,  # type: ignore[union-attr]
                     ),
                 )
 
