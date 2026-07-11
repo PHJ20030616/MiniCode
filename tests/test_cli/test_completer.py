@@ -32,14 +32,21 @@ class _AnotherStub(BaseCommand):
 
 @pytest.fixture
 def stub_registry() -> type:
-    """返回一个注册了桩命令的 CommandRegistry（通过 clear + register）。"""
+    """返回一个注册了桩命令的 CommandRegistry（测试后恢复原始状态）。"""
     from minicode.commands.registry import CommandRegistry
 
+    saved_commands = CommandRegistry._commands.copy()
+    saved_aliases = CommandRegistry._aliases.copy()
     CommandRegistry._commands.clear()
     CommandRegistry._aliases.clear()
     CommandRegistry.register(_StubCommand())
     CommandRegistry.register(_AnotherStub())
-    return CommandRegistry
+    yield CommandRegistry
+    # 恢复原始注册状态，避免跨测试污染
+    CommandRegistry._commands.clear()
+    CommandRegistry._commands.update(saved_commands)
+    CommandRegistry._aliases.clear()
+    CommandRegistry._aliases.update(saved_aliases)
 
 
 def test_no_completions_for_normal_text(stub_registry: type) -> None:
