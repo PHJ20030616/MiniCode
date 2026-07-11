@@ -20,6 +20,7 @@ from rich.text import Text
 
 from minicode.agent.context import build_messages
 from minicode.agent.system_prompt import build_system_prompt
+from minicode.memory.manager import MemoryManager
 from minicode.permissions.checker import check_permission
 from minicode.providers.base import (
     FunctionCall,
@@ -86,7 +87,42 @@ class AgentLoop:
         self.permission_store = permission_store
         self.permission_confirmer = permission_confirmer
         self.messages: list[Message] = []
-        self.system_prompt = build_system_prompt(tool_registry)
+        self._memory_enabled = config.memory.enabled
+
+        # 加载记忆内容（如果启用）
+        memory_content: str | None = None
+        if self._memory_enabled:
+            mm = MemoryManager(self.workspace_root)
+            memory_content = mm.get_all_content(
+                max_chars=config.memory.max_chars,
+                workspace=str(self.workspace_root),
+            )
+
+        self.system_prompt = build_system_prompt(
+            tool_registry,
+            memory_content=memory_content,
+            memory_enabled=self._memory_enabled,
+        )
+
+    def reload_memory(self) -> None:
+        """重新加载记忆并刷新系统提示词。
+
+        在记忆被添加或删除后调用，使当前会话立即反映最新记忆状态。
+        如果记忆系统已禁用，构建不含记忆内容和不含 remember 指令的 prompt。
+        """
+        memory_content: str | None = None
+        if self._memory_enabled:
+            mm = MemoryManager(self.workspace_root)
+            memory_content = mm.get_all_content(
+                max_chars=self.config.memory.max_chars,
+                workspace=str(self.workspace_root),
+            )
+
+        self.system_prompt = build_system_prompt(
+            self.tool_registry,
+            memory_content=memory_content,
+            memory_enabled=self._memory_enabled,
+        )
 
     async def run(self, user_input: str) -> str | None:
         """运行 ReAct 循环处理用户输入。
@@ -107,9 +143,17 @@ class AgentLoop:
             api_messages = build_messages(self.messages, self.system_prompt)
 
             # 调用 Provider
+            tools_schema = self.tool_registry.get_tools_schema()
+            # memory 禁用时从 tools schema 中过滤掉 remember
+            if not self._memory_enabled:
+                tools_schema = [
+                    t for t in tools_schema
+                    if t.get("function", {}).get("name") != "remember"
+                ]
+
             stream = self.provider.chat(
                 messages=api_messages,
-                tools=self.tool_registry.get_tools_schema(),
+                tools=tools_schema,
                 stream=self.config.agent.stream,
                 max_tokens=self.config.max_tokens,
             )
@@ -299,6 +343,18 @@ class AgentLoop:
                 # 返回 True 表示已拒绝，跳过执行
                 continue
 
+            # memory 禁用时拒绝 remember 工具（防御层）
+            if name == "remember" and not self._memory_enabled:
+                logger.debug("记忆系统已禁用，拒绝 remember 工具调用")
+                self.messages.append(
+                    ToolMessage(
+                        content="记忆系统已禁用，无法保存记忆。",
+                        tool_call_id=tc.id,
+                        name=name,
+                    )
+                )
+                continue
+
             logger.debug("执行工具", tool=name, args=args)
             self.renderer.console.print(
                 Text(f"\n── 正在调用工具：{name} ──", style="dim")
@@ -317,6 +373,10 @@ class AgentLoop:
                 self.renderer.show_info(f"工具执行成功（{len(result.output)} 字符）")
             else:
                 self.renderer.show_error(f"工具执行失败：{result.error or result.output}")
+
+            # remember 工具成功执行后刷新系统提示词
+            if name == "remember" and result.success and self._memory_enabled:
+                self.reload_memory()
 
             self.messages.append(
                 ToolMessage(

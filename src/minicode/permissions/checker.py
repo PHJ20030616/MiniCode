@@ -591,6 +591,25 @@ def _check_shell(
 
 
 # ---------------------------------------------------------------------------
+# remember 检查器（安全 — 不操作工作区文件）
+# ---------------------------------------------------------------------------
+
+
+@_register_checker("remember")
+def _check_remember(
+    arguments: dict[str, object],
+    workspace_root: Path,
+) -> PermissionDecision:
+    return PermissionDecision(
+        level=PermissionLevel.SAFE,
+        tool_name="remember",
+        operation="保存记忆",
+        summary="remember：保存用户记忆到 .minicode/memory/",
+        reasons=["记忆系统为仅在工作区 .minicode/ 目录下操作的安全工具"],
+    )
+
+
+# ---------------------------------------------------------------------------
 # 未知工具检查器
 # ---------------------------------------------------------------------------
 

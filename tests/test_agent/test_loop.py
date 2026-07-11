@@ -1113,3 +1113,226 @@ async def test_dangerous_without_confirmer_rejected(
     tool_msgs = [m for m in loop.messages if m.role == "tool"]
     assert len(tool_msgs) == 1
     assert "权限拒绝" in (tool_msgs[0].content or "")
+
+
+# ─── Memory disabled tests ──────────────────────────────────────────────
+
+
+@pytest.fixture
+def app_config_memory_disabled() -> AppConfig:
+    """memory.enabled=False 的测试用 AppConfig。"""
+    from minicode.config.models import MemoryConfig
+
+    return AppConfig(
+        default_provider="mock",
+        default_model="mock-model",
+        max_tokens=4096,
+        agent=AgentConfig(max_rounds=8, stream=True),
+        permissions=PermissionsConfig(trust_mode=False),
+        memory=MemoryConfig(enabled=False),
+        providers={
+            "mock": ProviderConfig(
+                api_key="sk-test",
+                base_url="https://api.mock.com/v1",
+                models=["mock-model"],
+            ),
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_memory_disabled_remember_filtered_from_schema(
+    tmp_path: Path, app_config_memory_disabled: AppConfig
+) -> None:
+    """memory.enabled=False 时 tools schema 不应包含 remember。"""
+    registry = create_default_registry()
+
+    # AgentLoop 应过滤 remember 工具
+    loop = AgentLoop(
+        provider=MockStepProvider([]),
+        tool_registry=registry,
+        renderer=MagicRenderer(),
+        config=app_config_memory_disabled,
+        workspace_root=tmp_path,
+    )
+    assert loop is not None
+
+
+@pytest.mark.asyncio
+async def test_memory_disabled_remember_execution_rejected(
+    tmp_path: Path, app_config_memory_disabled: AppConfig
+) -> None:
+    """memory.enabled=False 时 remember 执行应被拒绝。"""
+    provider = MockStepProvider([
+        # 第一轮：模型调用 remember
+        [
+            StreamChunk(
+                type="tool_call_delta",
+                tool_call=PartialToolCall(
+                    id="call_remember",
+                    index=0,
+                    name="remember",
+                    arguments='{"name": "test-mem", "content": "test content"}',
+                ),
+            ),
+            StreamChunk(type="done", usage=_make_usage(10, 5)),
+        ],
+        # 第二轮：模型基于结果回复
+        [
+            StreamChunk(type="text_delta", text="已处理记忆请求。"),
+            StreamChunk(type="done", usage=_make_usage(20, 6)),
+        ],
+    ])
+
+    loop = AgentLoop(
+        provider=provider,
+        tool_registry=create_default_registry(),
+        renderer=MagicRenderer(),
+        config=app_config_memory_disabled,
+        workspace_root=tmp_path,
+    )
+    response = await loop.run("记住测试内容")
+
+    assert response is not None
+    # 验证有 ToolMessage 且内容为"记忆系统已禁用"
+    tool_msgs = [m for m in loop.messages if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    assert "记忆系统已禁用" in (tool_msgs[0].content or "")
+
+
+@pytest.mark.asyncio
+async def test_memory_disabled_no_remember_in_system_prompt(
+    tmp_path: Path, app_config_memory_disabled: AppConfig
+) -> None:
+    """memory.enabled=False 时 system prompt 不应包含记忆工具说明和 remember 工具描述。"""
+    loop = AgentLoop(
+        provider=MockStepProvider([]),
+        tool_registry=create_default_registry(),
+        renderer=MagicRenderer(),
+        config=app_config_memory_disabled,
+        workspace_root=tmp_path,
+    )
+    assert "记忆工具使用说明" not in loop.system_prompt
+    assert "  - remember:" not in loop.system_prompt
+
+
+# ─── System prompt reload tests ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_reload_memory_updates_system_prompt(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """reload_memory() 应刷新 system prompt 以包含新记忆。"""
+    from datetime import UTC, datetime
+
+    from minicode.memory.manager import MemoryManager
+    from minicode.memory.models import MemoryMetadata, MemoryType
+
+    loop = AgentLoop(
+        provider=MockStepProvider([]),
+        tool_registry=create_default_registry(),
+        renderer=MagicRenderer(),
+        config=app_config,
+        workspace_root=tmp_path,
+    )
+
+    # 初始 system prompt 不含测试记忆
+    assert "test-reload-memory" not in loop.system_prompt
+
+    # 手动添加记忆
+    manager = MemoryManager(tmp_path)
+    now = datetime.now(UTC)
+    meta = MemoryMetadata(
+        name="test-reload-memory",
+        description="Reload test",
+        created_at=now,
+        updated_at=now,
+        type=MemoryType.USER,
+    )
+    manager.add(meta, "这是 reload 测试内容")
+
+    # 调用 reload
+    loop.reload_memory()
+
+    # system prompt 应包含新记忆的名称和内容
+    assert "test-reload-memory" in loop.system_prompt
+    assert "这是 reload 测试内容" in loop.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_reload_memory_after_delete_removes_from_prompt(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """删除记忆后 reload_memory() 不再包含被删记忆。"""
+    from datetime import UTC, datetime
+
+    from minicode.memory.manager import MemoryManager
+    from minicode.memory.models import MemoryMetadata, MemoryType
+
+    # 先添加一条记忆
+    manager = MemoryManager(tmp_path)
+    now = datetime.now(UTC)
+    meta = MemoryMetadata(
+        name="to-be-deleted",
+        description="将被删除",
+        created_at=now,
+        updated_at=now,
+        type=MemoryType.PROJECT,
+    )
+    manager.add(meta, "将被删除的内容")
+
+    loop = AgentLoop(
+        provider=MockStepProvider([]),
+        tool_registry=create_default_registry(),
+        renderer=MagicRenderer(),
+        config=app_config,
+        workspace_root=tmp_path,
+    )
+
+    # 初始提示词包含该记忆
+    assert "to-be-deleted" in loop.system_prompt
+
+    # 删除记忆
+    manager.delete("to-be-deleted")
+    loop.reload_memory()
+
+    # 提示词不应再包含被删记忆
+    assert "to-be-deleted" not in loop.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_reload_memory_disabled_no_content(
+    tmp_path: Path, app_config_memory_disabled: AppConfig
+) -> None:
+    """memory.enabled=False 时 reload_memory() 不注入任何记忆内容。"""
+    from datetime import UTC, datetime
+
+    from minicode.memory.manager import MemoryManager
+    from minicode.memory.models import MemoryMetadata, MemoryType
+
+    # 添加记忆（绕过禁用，直接操作文件）
+    manager = MemoryManager(tmp_path)
+    now = datetime.now(UTC)
+    meta = MemoryMetadata(
+        name="secret-memory",
+        description="不应出现",
+        created_at=now,
+        updated_at=now,
+        type=MemoryType.USER,
+    )
+    manager.add(meta, "不应出现的记忆内容")
+
+    loop = AgentLoop(
+        provider=MockStepProvider([]),
+        tool_registry=create_default_registry(),
+        renderer=MagicRenderer(),
+        config=app_config_memory_disabled,
+        workspace_root=tmp_path,
+    )
+
+    # reload 后不应包含任何记忆
+    loop.reload_memory()
+    assert "secret-memory" not in loop.system_prompt
+    assert "不应出现" not in loop.system_prompt
+    assert "用户记忆" not in loop.system_prompt

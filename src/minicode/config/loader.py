@@ -136,6 +136,10 @@ def _get_defaults() -> dict[str, Any]:
         "permissions": {
             "trust_mode": False,
         },
+        "memory": {
+            "enabled": True,
+            "max_chars": 8000,
+        },
     }
 
 

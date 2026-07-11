@@ -30,6 +30,15 @@ class PermissionsConfig(BaseModel):
     """是否跳过 caution/dangerous 工具的确认提示。"""
 
 
+class MemoryConfig(BaseModel):
+    """记忆系统配置。"""
+
+    enabled: bool = True
+    """是否启用记忆系统。"""
+    max_chars: int = 8000
+    """注入 Agent 系统提示词时记忆内容的最大字符数。"""
+
+
 class AppConfig(BaseModel):
     """MiniCode 应用顶层配置。"""
 
@@ -58,3 +67,5 @@ class AppConfig(BaseModel):
     """Agent 循环相关配置。"""
     permissions: PermissionsConfig = Field(default_factory=PermissionsConfig)
     """权限控制相关配置。"""
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    """记忆系统相关配置。"""
