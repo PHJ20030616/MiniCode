@@ -35,3 +35,16 @@ class ToolError(MiniCodeError):
     包括文件不存在、路径越权、shell 命令失败、输出截断等。
     错误信息会同时返回给模型和用户。
     """
+
+
+class RetryExhaustedError(MiniCodeError):
+    """重试耗尽错误。
+
+    当 transient 错误在指定次数的重试后仍无法恢复时抛出。
+    包含重试次数和最后一次错误的详情，供上层渲染友好消息。
+    """
+
+    def __init__(self, message: str, attempts: int = 0, last_error: str = "") -> None:
+        self.attempts = attempts
+        self.last_error = last_error
+        super().__init__(message)
