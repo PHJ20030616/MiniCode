@@ -151,6 +151,16 @@ class MockNonStreamingResponse:
         self.created = created
 
 
+class MockRequest:
+    """模拟 httpx.Request 对象。"""
+
+    def __init__(self) -> None:
+        self.method = "POST"
+        self.url = "https://test.com/v1/chat/completions"
+        self.headers: dict[str, str] = {}
+        self.content = b""
+
+
 class MockModel:
     """模拟 Model 对象。"""
 
@@ -638,7 +648,7 @@ class TestErrorHandling:
                 pass
 
     async def test_rate_limit_error(self, mock_client: Any) -> None:
-        """429 错误应转换为 ProviderError。"""
+        """429 错误重试耗尽后应 yield error chunk。"""
         mock_client.chat.completions.create.side_effect = openai.RateLimitError(
             "Rate limit exceeded",
             response=mocker_http_response(429),
@@ -646,12 +656,14 @@ class TestErrorHandling:
         )
 
         provider = make_provider()
-        with pytest.raises(ProviderError, match="请求过于频繁"):
-            async for _ in provider.chat(messages=[Message(role="user", content="Hi")]):
-                pass
+        chunks = [chunk async for chunk in provider.chat(messages=[Message(role="user", content="Hi")])]
+
+        error_chunks = [c for c in chunks if c.type == "error"]
+        assert len(error_chunks) == 1
+        assert "重试" in (error_chunks[0].text or "")
 
     async def test_internal_server_error(self, mock_client: Any) -> None:
-        """5xx 错误应转换为 ProviderError。"""
+        """5xx 错误重试耗尽后应 yield error chunk。"""
         mock_client.chat.completions.create.side_effect = openai.InternalServerError(
             "Server error",
             response=mocker_http_response(500),
@@ -659,23 +671,27 @@ class TestErrorHandling:
         )
 
         provider = make_provider()
-        with pytest.raises(ProviderError, match="服务端错误"):
-            async for _ in provider.chat(messages=[Message(role="user", content="Hi")]):
-                pass
+        chunks = [chunk async for chunk in provider.chat(messages=[Message(role="user", content="Hi")])]
+
+        error_chunks = [c for c in chunks if c.type == "error"]
+        assert len(error_chunks) == 1
+        assert "重试" in (error_chunks[0].text or "")
 
     async def test_timeout_error(self, mock_client: Any) -> None:
-        """超时错误应转换为 ProviderError。"""
+        """超时错误重试耗尽后应 yield error chunk。"""
         mock_client.chat.completions.create.side_effect = openai.APITimeoutError(
             "Request timed out"
         )
 
         provider = make_provider()
-        with pytest.raises(ProviderError, match="请求超时"):
-            async for _ in provider.chat(messages=[Message(role="user", content="Hi")]):
-                pass
+        chunks = [chunk async for chunk in provider.chat(messages=[Message(role="user", content="Hi")])]
+
+        error_chunks = [c for c in chunks if c.type == "error"]
+        assert len(error_chunks) == 1
+        assert "重试" in (error_chunks[0].text or "")
 
     async def test_connection_error(self, mock_client: Any) -> None:
-        """APIConnectionError 应转换为 ProviderError。"""
+        """APIConnectionError 重试耗尽后应 yield error chunk。"""
         mock_request = type(
             "MockRequest",
             (),
@@ -692,9 +708,11 @@ class TestErrorHandling:
         )
 
         provider = make_provider()
-        with pytest.raises(ProviderError, match="网络连接失败"):
-            async for _ in provider.chat(messages=[Message(role="user", content="Hi")]):
-                pass
+        chunks = [chunk async for chunk in provider.chat(messages=[Message(role="user", content="Hi")])]
+
+        error_chunks = [c for c in chunks if c.type == "error"]
+        assert len(error_chunks) == 1
+        assert "重试" in (error_chunks[0].text or "")
 
     async def test_api_status_error(self, mock_client: Any) -> None:
         """其他 API 状态错误应转换为 ProviderError。"""
@@ -708,6 +726,89 @@ class TestErrorHandling:
         with pytest.raises(ProviderError, match="异常状态码 400"):
             async for _ in provider.chat(messages=[Message(role="user", content="Hi")]):
                 pass
+
+
+class TestRetryIntegration:
+    """验证 Provider 层重试集成。"""
+
+    async def test_transient_error_retried_then_succeeds(self, mock_client: Any) -> None:
+        """transient 错误应被重试，恢复后正常返回结果。"""
+        call_count = 0
+
+        async def fail_then_ok(**kwargs: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise openai.APITimeoutError("timeout")
+            return async_gen(
+                MockChunk(choices=[MockChoice(delta=MockDelta(content="最终回复"))], model="test-model"),
+                MockChunk(choices=[MockChoice(delta=MockDelta(), finish_reason="stop")], model="test-model"),
+            )
+
+        mock_client.chat.completions.create = fail_then_ok  # type: ignore[method-assign]
+
+        provider = make_provider()
+        chunks = [chunk async for chunk in provider.chat(messages=[Message(role="user", content="你好")])]
+
+        assert call_count == 3
+        assert any(c.text == "最终回复" for c in chunks if c.type == "text_delta")
+
+    async def test_all_retries_exhausted_yields_error_chunk(self, mock_client: Any) -> None:
+        """流式模式下重试耗尽应 yield error chunk。"""
+        mock_client.chat.completions.create.side_effect = openai.APITimeoutError("always timeout")
+
+        provider = make_provider()
+        chunks = [chunk async for chunk in provider.chat(messages=[Message(role="user", content="你好")])]
+
+        # 应至少有一个 error chunk
+        error_chunks = [c for c in chunks if c.type == "error"]
+        assert len(error_chunks) == 1
+        assert "重试" in (error_chunks[0].text or "")
+
+    async def test_non_stream_retry_exhausted_raises(self, mock_client: Any) -> None:
+        """非流式模式下重试耗尽应抛出 ProviderError。"""
+        mock_client.chat.completions.create.side_effect = openai.APITimeoutError("timeout")
+
+        provider = make_provider()
+        with pytest.raises(ProviderError, match="重试"):
+            async for _ in provider.chat(messages=[Message(role="user", content="你好")], stream=False):
+                pass
+
+    async def test_auth_error_not_retried(self, mock_client: Any) -> None:
+        """401 错误不应触发重试，立即抛出 ProviderError。"""
+        call_count = 0
+
+        async def auth_fail(**kwargs: Any) -> Any:
+            nonlocal call_count
+            call_count += 1
+            response = type("MockResponse", (), {"status_code": 401, "headers": {}, "request": MockRequest()})()
+            raise openai.AuthenticationError("bad key", response=response, body=None)
+
+        mock_client.chat.completions.create = auth_fail  # type: ignore[method-assign]
+
+        provider = make_provider()
+        with pytest.raises(ProviderError, match="API key 认证失败"):
+            async for _ in provider.chat(messages=[Message(role="user", content="你好")]):
+                pass
+        assert call_count == 1  # 不应重试
+
+    async def test_list_models_retry_then_succeed(self, mock_client: Any) -> None:
+        """list_models 也应支持重试。"""
+        call_count = 0
+
+        async def fail_then_ok() -> Any:
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                raise openai.APITimeoutError("timeout")
+            return MockModelList(data=[MockModel("gpt-4o")])
+
+        mock_client.models.list = fail_then_ok  # type: ignore[method-assign]
+
+        provider = make_provider()
+        models = await provider.list_models()
+        assert models == ["gpt-4o"]
+        assert call_count == 2
 
 
 # ─── list_models 测试 ────────────────────────────────────────────
@@ -741,15 +842,15 @@ class TestListModels:
             await provider.list_models()
 
     async def test_list_models_timeout(self, mock_client: Any) -> None:
-        """list_models 的超时应转换为 ProviderError。"""
+        """list_models 的超时重试耗尽后应抛出包含重试信息的 ProviderError。"""
         mock_client.models.list = mocker_async_raise(openai.APITimeoutError("Timeout"))
 
         provider = make_provider()
-        with pytest.raises(ProviderError, match="获取模型列表超时"):
+        with pytest.raises(ProviderError, match="重试"):
             await provider.list_models()
 
     async def test_list_models_connection_error(self, mock_client: Any) -> None:
-        """list_models 的 APIConnectionError 应转换为 ProviderError。"""
+        """list_models 的 APIConnectionError 重试耗尽后应抛出包含重试信息的 ProviderError。"""
         mock_request = type(
             "MockRequest",
             (),
@@ -765,7 +866,7 @@ class TestListModels:
         )
 
         provider = make_provider()
-        with pytest.raises(ProviderError, match="网络连接失败"):
+        with pytest.raises(ProviderError, match="重试"):
             await provider.list_models()
 
 

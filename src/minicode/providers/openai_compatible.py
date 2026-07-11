@@ -29,7 +29,8 @@ from minicode.providers.base import (
     UsageInfo,
 )
 from minicode.providers.registry import ProviderRegistry
-from minicode.utils.exceptions import ProviderError
+from minicode.utils.exceptions import ProviderError, RetryExhaustedError
+from minicode.utils.retry import RetryConfig, async_retry
 
 
 class OpenAICompatibleProvider(BaseProvider):
@@ -77,7 +78,8 @@ class OpenAICompatibleProvider(BaseProvider):
     ) -> AsyncIterator[StreamChunk]:
         """发送对话请求并返回流式响应。
 
-        v0.1 文本输出使用流式；工具调用阶段允许非流式以降低复杂度。
+        transient 错误（超时/断网/429/5xx）自动重试最多 3 次。
+        重试耗尽后流式模式 yield error chunk，非流式模式抛出 ProviderError。
         """
         kwargs = self._build_request_kwargs(messages, tools, stream, max_tokens)
 
@@ -88,24 +90,55 @@ class OpenAICompatibleProvider(BaseProvider):
             else:
                 async for chunk in self._non_stream_chat(**kwargs):
                     yield chunk
+        except RetryExhaustedError as e:
+            error_msg = f"请求在 {e.attempts} 次重试后仍然失败。{e.last_error}"
+            if stream:
+                yield StreamChunk(type="error", text=error_msg)
+            else:
+                raise ProviderError(error_msg) from None
         except openai.APITimeoutError:
-            raise ProviderError("请求超时，请检查网络连接或增加超时时间。") from None
+            raise ProviderError(
+                f"请求超时（{self._client._timeout}s）。"
+                "请检查网络连接或增加超时时间。"
+            ) from None
         except openai.APIConnectionError:
-            raise ProviderError("网络连接失败，请检查网络连接或 API 地址是否正确。") from None
+            raise ProviderError(
+                f"无法连接到 {self._client.base_url}。"
+                "请检查：1) 网络连接 2) API 地址是否正确 3) 是否需要代理"
+            ) from None
         except openai.AuthenticationError as e:
-            raise ProviderError(f"API key 认证失败（401），请检查 api_key 配置。\n详情：{e}") from e
+            raise ProviderError(
+                f"API key 认证失败（401）。"
+                f"请检查：1) api_key 配置是否正确 2) base_url 是否指向正确的 API 地址\n"
+                f"详情：{e}"
+            ) from e
         except openai.RateLimitError as e:
-            raise ProviderError(f"请求过于频繁（429），请稍后重试。\n详情：{e}") from e
+            raise ProviderError(
+                f"请求频率过高（429），请稍后重试或检查用量配额。\n详情：{e}"
+            ) from e
         except openai.InternalServerError as e:
-            raise ProviderError(f"服务端错误（{e.status_code}），请稍后重试。\n详情：{e}") from e
+            raise ProviderError(
+                f"服务端暂时不可用（{e.status_code}），请稍后重试。\n详情：{e}"
+            ) from e
         except openai.APIStatusError as e:
             raise ProviderError(f"API 返回异常状态码 {e.status_code}：{e}") from e
 
     async def list_models(self) -> list[str]:
-        """获取当前 Provider 可用的模型列表。"""
+        """获取当前 Provider 可用的模型列表。
+
+        transient 错误自动重试最多 3 次。
+        """
         try:
-            response = await self._client.models.list()
+            retry_config = RetryConfig()
+            response = await async_retry(
+                self._client.models.list,
+                config=retry_config,
+            )
             return [model.id for model in response.data]
+        except RetryExhaustedError as e:
+            raise ProviderError(
+                f"获取模型列表在 {e.attempts} 次重试后仍然失败：{e.last_error}"
+            ) from None
         except openai.APITimeoutError:
             raise ProviderError("获取模型列表超时，请检查网络连接。") from None
         except openai.APIConnectionError:
@@ -143,14 +176,14 @@ class OpenAICompatibleProvider(BaseProvider):
     async def _stream_chat(self, **kwargs: Any) -> AsyncIterator[StreamChunk]:
         """处理流式响应的内部方法。
 
-        支持 stream_options={"include_usage": True} 的两阶段结束模式：
-        先发 finish_reason chunk（无 usage），后发 choices=[] 的 usage-only chunk。
-        通过 finished 状态 + 流结束后 fallback 保证：
-        - finish_reason 自带 usage → 立即 yield done
-        - finish_reason 无 usage → 等待 usage-only chunk；流结束仍无则 fallback done(None)
-        - 始终只 yield 一次 done
+        使用 async_retry 包裹 API 调用，transient 错误自动重试。
         """
-        stream = await self._client.chat.completions.create(**kwargs)
+        retry_config = RetryConfig()
+        stream = await async_retry(
+            self._client.chat.completions.create,
+            **kwargs,
+            config=retry_config,
+        )
         finished = False
 
         async for chunk in stream:
@@ -197,10 +230,16 @@ class OpenAICompatibleProvider(BaseProvider):
     async def _non_stream_chat(self, **kwargs: Any) -> AsyncIterator[StreamChunk]:
         """处理非流式响应的内部方法。
 
-        v0.1 中工具调用阶段使用此方法以降低复杂度。
+        使用 async_retry 包裹 API 调用，transient 错误自动重试。
         """
         kwargs.pop("stream", None)
-        response = await self._client.chat.completions.create(**kwargs, stream=False)
+        retry_config = RetryConfig()
+        response = await async_retry(
+            self._client.chat.completions.create,
+            **kwargs,
+            stream=False,
+            config=retry_config,
+        )
         choice = response.choices[0]
 
         # 处理文本内容
