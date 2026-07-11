@@ -11,6 +11,7 @@ import pytest
 from minicode.agent import AgentLoop
 from minicode.cli.app import ChatApp
 from minicode.config.models import AgentConfig, AppConfig, PermissionsConfig, ProviderConfig
+from minicode.providers.base import Message
 from minicode.providers.registry import MockProvider
 from minicode.utils.exceptions import ProviderError
 
@@ -231,6 +232,38 @@ class TestAppRun:
         mock_session.prompt_async = AsyncMock(side_effect=EOFError)
         chat_app._prompt_session = mock_session
         await chat_app.run()
+
+    async def test_shutdown_gracefully_with_agent_loop(
+        self, chat_app: ChatApp, mock_stdout: MagicMock
+    ) -> None:
+        """模拟 shutdown 应保存当前会话。"""
+        # 先触发 AgentLoop 创建
+        with patch("minicode.cli.app.ProviderRegistry.get", return_value=MockProvider("ok")):
+            agent_loop = chat_app._get_agent_loop()
+            # 填充一些消息
+            agent_loop.messages.append(Message(role="user", content="测试"))
+
+        # 模拟会话存在
+        session_manager = chat_app._get_session_manager()
+        chat_app._current_session = session_manager.create(
+            model="test", provider="test", workspace_root="/tmp"
+        )
+
+        # 执行优雅关闭
+        await chat_app._shutdown_gracefully()
+
+        # 当前会话应被保存到磁盘
+        assert chat_app._current_session.id is not None
+        saved = session_manager.load(chat_app._current_session.id)
+        assert saved is not None
+
+    async def test_shutdown_gracefully_no_session(
+        self, chat_app: ChatApp, mock_stdout: MagicMock
+    ) -> None:
+        """没有活跃会话时 shutdown 不应出错。"""
+        chat_app._current_session = None
+        chat_app._agent_loop = None
+        await chat_app._shutdown_gracefully()  # 不应抛异常
 
 
 @pytest.mark.asyncio

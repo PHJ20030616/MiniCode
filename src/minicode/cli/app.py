@@ -48,6 +48,7 @@ class ChatApp:
         self._agent_loop: AgentLoop | None = None
         self._session_manager: SessionManager | None = None
         self._current_session: Session | None = None
+        self._interrupted: bool = False
 
     @property
     def session(self) -> PromptSession[Any]:
@@ -60,10 +61,25 @@ class ChatApp:
         """运行对话主循环。
 
         持续接收用户输入，调用 AgentLoop 处理，直到用户输入 exit/quit 或按 Ctrl+C/D 退出。
+        注册 SIGINT 信号处理器，确保中断时优雅保存会话。
         """
+        import signal
+
         self.renderer.show_info("输入 exit 或 Ctrl+C 退出。")
 
+        # 注册 SIGINT 处理器：设置中断标志
+        self._interrupted = False
+
+        def _handle_sigint(signum: object, frame: object) -> None:
+            self._interrupted = True
+
+        signal.signal(signal.SIGINT, _handle_sigint)
+
         while True:
+            if self._interrupted:
+                await self._shutdown_gracefully()
+                break
+
             try:
                 with patch_stdout():
                     user_input = await self.session.prompt_async("> ")
@@ -77,8 +93,25 @@ class ChatApp:
                     break
 
             except (KeyboardInterrupt, EOFError):
-                self.renderer.show_info("再见！")
+                await self._shutdown_gracefully()
                 break
+
+    async def _shutdown_gracefully(self) -> None:
+        """优雅关闭：保存当前会话 + 清理资源。
+
+        在收到退出信号或全局异常时调用。
+        使用 fail-soft 策略：保存失败不阻断退出流程。
+        """
+        logger.debug("正在优雅关闭...")
+        try:
+            if self._agent_loop is not None and self._current_session is not None:
+                self._current_session.messages = list(self._agent_loop.messages)
+                self._current_session.updated_at = datetime.now(UTC)
+                self._get_session_manager().save(self._current_session)
+                logger.debug("会话已保存", session_id=self._current_session.id)
+        except Exception as e:
+            logger.debug("优雅关闭时保存会话失败", error=str(e))
+        self.renderer.show_info("再见！")
 
     def _get_agent_loop(self) -> AgentLoop:
         """获取 AgentLoop 实例（懒加载并缓存）。

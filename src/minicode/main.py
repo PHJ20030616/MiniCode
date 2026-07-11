@@ -128,11 +128,15 @@ def main(
 
     except ConfigError as e:
         typer.echo(f"配置错误：{e}", err=True)
-        logger.debug("配置错误", error=str(e), exc_info=True)
+        logger.debug("配置加载失败", error=str(e), exc_info=True)
         raise typer.Exit(code=1) from None
     except MiniCodeError as e:
         typer.echo(f"错误：{e}", err=True)
         logger.debug("运行时错误", error=str(e), exc_info=True)
+        raise typer.Exit(code=1) from None
+    except Exception as e:
+        typer.echo(f"发生未预期的错误：{e}", err=True)
+        logger.debug("未捕获的异常", error=str(e), exc_info=True)
         raise typer.Exit(code=1) from None
 
 
