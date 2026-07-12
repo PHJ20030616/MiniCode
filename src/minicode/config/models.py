@@ -2,6 +2,8 @@
 
 from pydantic import BaseModel, Field
 
+from minicode.agent.context_models import ContextConfig
+
 
 class ProviderConfig(BaseModel):
     """AI 提供商连接配置。"""
@@ -21,6 +23,8 @@ class AgentConfig(BaseModel):
     """Agent Loop 最大迭代轮次。"""
     stream: bool = True
     """是否启用流式输出。"""
+    context: ContextConfig = Field(default_factory=ContextConfig)
+    """上下文窗口管理配置。"""
 
 
 class PermissionsConfig(BaseModel):

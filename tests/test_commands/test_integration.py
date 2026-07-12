@@ -29,7 +29,7 @@ class TestFullCommandChain:
 
         all_cmds = CommandRegistry.list_all()
         names = {c.name for c in all_cmds}
-        assert names == {"quit", "help", "clear", "session", "config", "memory"}
+        assert names == {"quit", "help", "clear", "session", "config", "memory", "context"}
 
     def test_quit_aliases_findable(self) -> None:
         """别名的命令应可通过别名查找。"""
@@ -79,6 +79,7 @@ class TestFullCommandChain:
         assert "session" in (result.message or "")
         assert "config" in (result.message or "")
         assert "memory" in (result.message or "")
+        assert "context" in (result.message or "")
 
 
 @pytest.mark.asyncio

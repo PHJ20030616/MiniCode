@@ -30,6 +30,9 @@ ENV_CONFIG_MAP: dict[str, tuple[str, ...]] = {
     "MINICODE_MAX_ROUNDS": ("agent", "max_rounds"),
     "MINICODE_STREAM": ("agent", "stream"),
     "MINICODE_TRUST_MODE": ("permissions", "trust_mode"),
+    "MINICODE_CONTEXT_MAX_INPUT_TOKENS": ("agent", "context", "max_input_tokens"),
+    "MINICODE_CONTEXT_RECENT_MESSAGES": ("agent", "context", "recent_messages"),
+    "MINICODE_CONTEXT_MAX_TOOL_OUTPUT_CHARS": ("agent", "context", "max_tool_output_chars"),
 }
 
 # 用于发现提供商环境变量的前后缀
@@ -132,6 +135,12 @@ def _get_defaults() -> dict[str, Any]:
         "agent": {
             "max_rounds": 20,
             "stream": True,
+            "context": {
+                "max_input_tokens": 24000,
+                "recent_messages": 16,
+                "max_tool_output_chars": 12000,
+                "keep_first_user_message": True,
+            },
         },
         "permissions": {
             "trust_mode": False,

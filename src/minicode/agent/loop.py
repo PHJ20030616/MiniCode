@@ -20,6 +20,7 @@ from rich.markdown import Markdown
 from rich.text import Text
 
 from minicode.agent.context import build_messages
+from minicode.agent.context_models import ContextBuildReport
 from minicode.agent.system_prompt import build_system_prompt
 from minicode.memory.manager import MemoryManager
 from minicode.permissions.checker import check_permission
@@ -89,6 +90,7 @@ class AgentLoop:
         self.permission_store = permission_store
         self.permission_confirmer = permission_confirmer
         self.messages: list[Message] = []
+        self.last_context_report: ContextBuildReport | None = None
         self._memory_enabled = config.memory.enabled
 
         # 加载记忆内容（如果启用）
@@ -142,8 +144,14 @@ class AgentLoop:
         for round_num in range(1, self.config.agent.max_rounds + 1):
             logger.debug("ReAct 轮次", round=round_num)
 
-            # 构建 API 消息（system + history）
-            api_messages = build_messages(self.messages, self.system_prompt)
+            # 构建 API 消息（system + history），含上下文预算控制
+            context_result = build_messages(
+                self.messages,
+                self.system_prompt,
+                self.config.agent.context,
+            )
+            self.last_context_report = context_result.report
+            api_messages = context_result.messages
 
             # 调用 Provider
             tools_schema = self.tool_registry.get_tools_schema()

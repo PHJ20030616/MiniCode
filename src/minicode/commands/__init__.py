@@ -31,6 +31,7 @@ def register_all_commands() -> None:
 
     from minicode.commands.clear_cmd import ClearCommand
     from minicode.commands.config_cmd import ConfigCommand
+    from minicode.commands.context_cmd import ContextCommand
     from minicode.commands.help_cmd import HelpCommand
     from minicode.commands.memory_cmd import MemoryCommand
     from minicode.commands.quit_cmd import QuitCommand
@@ -42,3 +43,4 @@ def register_all_commands() -> None:
     CommandRegistry.register(SessionCommand())
     CommandRegistry.register(ConfigCommand())
     CommandRegistry.register(MemoryCommand())
+    CommandRegistry.register(ContextCommand())

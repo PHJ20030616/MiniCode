@@ -357,6 +357,38 @@ class TestEnvVarOverride:
         assert config.agent.max_rounds == 10
         assert config.agent.stream is False
 
+    def test_env_context_max_input_tokens(self, fake_home: Path, monkeypatch) -> None:
+        """验证 MINICODE_CONTEXT_MAX_INPUT_TOKENS 被正确解析为 int。"""
+        monkeypatch.setenv("MINICODE_CONTEXT_MAX_INPUT_TOKENS", "32000")
+        monkeypatch.setenv("MINICODE_DEEPSEEK_API_KEY", "sk-key")
+        config = load()
+        assert config.agent.context.max_input_tokens == 32000
+
+    def test_env_context_recent_messages(self, fake_home: Path, monkeypatch) -> None:
+        """验证 MINICODE_CONTEXT_RECENT_MESSAGES 被正确解析为 int。"""
+        monkeypatch.setenv("MINICODE_CONTEXT_RECENT_MESSAGES", "8")
+        monkeypatch.setenv("MINICODE_DEEPSEEK_API_KEY", "sk-key")
+        config = load()
+        assert config.agent.context.recent_messages == 8
+
+    def test_env_context_max_tool_output_chars(self, fake_home: Path, monkeypatch) -> None:
+        """验证 MINICODE_CONTEXT_MAX_TOOL_OUTPUT_CHARS 被正确解析为 int。"""
+        monkeypatch.setenv("MINICODE_CONTEXT_MAX_TOOL_OUTPUT_CHARS", "5000")
+        monkeypatch.setenv("MINICODE_DEEPSEEK_API_KEY", "sk-key")
+        config = load()
+        assert config.agent.context.max_tool_output_chars == 5000
+
+    def test_env_context_max_tool_output_chars_zero_raises(
+        self, fake_home: Path, monkeypatch
+    ) -> None:
+        """MINICODE_CONTEXT_MAX_TOOL_OUTPUT_CHARS=0 时 load() 抛出 ValidationError。"""
+        from pydantic import ValidationError
+
+        monkeypatch.setenv("MINICODE_CONTEXT_MAX_TOOL_OUTPUT_CHARS", "0")
+        monkeypatch.setenv("MINICODE_DEEPSEEK_API_KEY", "sk-key")
+        with pytest.raises(ValidationError):
+            load()
+
 
 @pytest.mark.usefixtures("clean_minicode_env")
 class TestPlaceholderResolution:
