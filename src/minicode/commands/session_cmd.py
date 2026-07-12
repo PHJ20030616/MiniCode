@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import shutil
 from contextlib import suppress
 
 from prompt_toolkit.input import create_input
@@ -16,8 +17,53 @@ from minicode.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-# 交互式选择器最多显示的会话数
-_MAX_INTERACTIVE_SESSIONS = 20
+
+def _get_display_summary(s: dict) -> str:
+    """获取会话的显示概要（向后兼容）。
+
+    优先使用 summary 字段，不存在时降级使用 name，两者都为空时返回固定文本。
+
+    Args:
+        s: 会话摘要字典。
+
+    Returns:
+        显示用的概要字符串。
+    """
+    summary: str | None = s.get("summary")  # type: ignore[type-arg]
+    if summary:
+        return summary
+    name: str | None = s.get("name")  # type: ignore[type-arg]
+    if name:
+        return name
+    return "（无概要）"
+
+
+def _compute_scroll_offset(
+    selected_idx: int,
+    scroll_offset: int,
+    visible_count: int,
+    total_count: int,
+) -> int:
+    """根据选中索引计算新的滚动偏移量。
+
+    Args:
+        selected_idx: 当前选中的索引。
+        scroll_offset: 当前窗口起始偏移。
+        visible_count: 窗口可见条目数。
+        total_count: 总条目数。
+
+    Returns:
+        计算后的新滚动偏移量。
+    """
+    if total_count <= 0 or visible_count <= 0:
+        return 0
+
+    max_offset = max(0, total_count - visible_count)
+    if selected_idx < scroll_offset:
+        scroll_offset = selected_idx
+    elif selected_idx >= scroll_offset + visible_count:
+        scroll_offset = selected_idx - visible_count + 1
+    return max(0, min(scroll_offset, max_offset))
 
 
 class SessionCommand(BaseCommand):
@@ -25,7 +71,7 @@ class SessionCommand(BaseCommand):
 
     用法：
         /session              → 交互式方向键选择会话
-        /session list         → 列出最近 20 条会话
+        /session list         → 列出所有会话
         /session switch <id>  → 切换到指定会话
         /session delete <id>  → 删除指定会话
     """
@@ -75,27 +121,19 @@ class SessionCommand(BaseCommand):
     # ─── 子命令处理 ─────────────────────────────────────────
 
     async def _handle_list(self, ctx: CommandContext) -> CommandResult:
-        """列出最近 20 条会话摘要。"""
+        """列出所有会话摘要。"""
         sessions = ctx.session_manager.list_sessions()
-        recent = sessions[:_MAX_INTERACTIVE_SESSIONS]
 
-        if not recent:
+        if not sessions:
             return CommandResult(message="没有保存的会话。")
 
         lines: list[str] = []
-        lines.append(f"会话列表（最近 {len(recent)} 条）：")
+        lines.append(f"会话列表（共 {len(sessions)} 条）：")
         lines.append("")
 
-        for i, s in enumerate(recent, 1):
-            sid = s.get("id", "")[:8]
-            name = s.get("name", "")
-            updated = s.get("updated_at", "")[:16]
-            msg_count = s.get("message_count", 0)
-            model = s.get("model", "")
-            lines.append(
-                f"  {i:2d}. [{sid}] {name}  · "
-                f"{msg_count} 条消息  ·  {model}  ·  {updated}"
-            )
+        for i, s in enumerate(sessions, 1):
+            summary = _get_display_summary(s)
+            lines.append(f"  {i:2d}. {summary}")
 
         return CommandResult(message="\n".join(lines))
 
@@ -150,8 +188,7 @@ class SessionCommand(BaseCommand):
         if not sessions:
             return CommandResult(message="没有保存的会话。")
 
-        recent = sessions[:_MAX_INTERACTIVE_SESSIONS]
-        selected_id = await self._interactive_select(recent, ctx)
+        selected_id = await self._interactive_select(sessions, ctx)
 
         if selected_id is None:
             return CommandResult(message="已取消。")
@@ -164,6 +201,7 @@ class SessionCommand(BaseCommand):
         """使用 Rich Live + prompt_toolkit 输入实现方向键交互式选择。
 
         在终端内渲染会话列表，支持 ↑↓ 导航、Enter 确认、Esc 取消。
+        当会话数超出终端高度时，视口自动跟随选中项滚动。
 
         Args:
             sessions: 会话摘要列表。
@@ -172,67 +210,94 @@ class SessionCommand(BaseCommand):
         Returns:
             选中的 session_id，取消时返回 None。
         """
+        total = len(sessions)
         selected_idx = 0
+        scroll_offset = 0
         done: asyncio.Event = asyncio.Event()
         result: str | None = None
 
+        def _clamp_scroll_offset() -> None:
+            """根据终端高度调整 scroll_offset，确保选中项在可见区域内。"""
+            nonlocal scroll_offset
+            terminal_lines = shutil.get_terminal_size().lines
+            # 表头约 3 行 + 上下折叠提示各 1 行 + 余量 1 行
+            visible_count = max(5, terminal_lines - 6)
+            scroll_offset = _compute_scroll_offset(
+                selected_idx, scroll_offset, visible_count, total,
+            )
+
         def build_table() -> Table:
-            """构建当前选择状态的 Rich Table。"""
+            """构建当前选择状态和视口位置的 Rich Table。"""
+            nonlocal scroll_offset
+            _clamp_scroll_offset()
+
+            terminal_lines = shutil.get_terminal_size().lines
+            visible_count = max(5, terminal_lines - 6)
+            end = min(scroll_offset + visible_count, total)
+
             table = Table(
-                title="会话历史（↑↓ 选择，Enter 加载，Esc 取消）",
+                title=(
+                    f"会话历史（↑↓ 选择，Enter 加载，Esc 取消）"
+                    f" — {scroll_offset + 1}-{end} / 共 {total} 条"
+                ),
                 title_style="bold",
                 show_header=True,
                 header_style="bold",
             )
             table.add_column("#", style="dim", width=4)
-            table.add_column("名称", style="cyan")
-            table.add_column("时间", style="dim")
-            table.add_column("消息数", justify="right")
-            table.add_column("模型", style="green")
+            table.add_column("概要", style="cyan")
 
-            for i, s in enumerate(sessions):
-                prefix = ">" if i == selected_idx else " "
-                style = "reverse" if i == selected_idx else ""
-                name = s.get("name", "")
-                updated = s.get("updated_at", "")[:16]
-                msg_count = str(s.get("message_count", 0))
-                model = s.get("model", "")
+            # 上方折叠提示
+            if scroll_offset > 0:
+                table.add_row(
+                    "…", f"以上 {scroll_offset} 条",
+                    style="dim",
+                )
+
+            for i, s in enumerate(sessions[scroll_offset:end]):
+                actual_idx = scroll_offset + i
+                prefix = ">" if actual_idx == selected_idx else " "
+                style = "reverse" if actual_idx == selected_idx else ""
+                summary = _get_display_summary(s)
 
                 if style:
                     table.add_row(
-                        f"[reverse]{prefix} {i + 1}[/]",
-                        f"[reverse]{name}[/]",
-                        f"[reverse]{updated}[/]",
-                        f"[reverse]{msg_count}[/]",
-                        f"[reverse]{model}[/]",
+                        f"[reverse]{prefix} {actual_idx + 1}[/]",
+                        f"[reverse]{summary}[/]",
                     )
                 else:
                     table.add_row(
-                        f"  {i + 1}",
-                        name,
-                        updated,
-                        msg_count,
-                        model,
+                        f"  {actual_idx + 1}",
+                        summary,
                     )
+
+            # 下方折叠提示
+            remaining = total - end
+            if remaining > 0:
+                table.add_row(
+                    "…", f"以下 {remaining} 条",
+                    style="dim",
+                )
 
             return table
 
         async def listen_keys() -> None:
-            """监听键盘事件，更新选中索引。"""
-            nonlocal selected_idx, result
+            """监听键盘事件，更新选中索引和视口偏移。"""
+            nonlocal selected_idx, result, scroll_offset
 
             input_obj = create_input()
             loop = asyncio.get_running_loop()
             try:
                 with input_obj.raw_mode():
                     while not done.is_set():
-                        # read_keys() 是同步阻塞方法，用线程池执行器包装
                         keys = await loop.run_in_executor(None, input_obj.read_keys)
                         for key_press in keys:
                             if key_press.key == Keys.Up:
-                                selected_idx = (selected_idx - 1) % len(sessions)
+                                selected_idx = (selected_idx - 1) % total
+                                _clamp_scroll_offset()
                             elif key_press.key == Keys.Down:
-                                selected_idx = (selected_idx + 1) % len(sessions)
+                                selected_idx = (selected_idx + 1) % total
+                                _clamp_scroll_offset()
                             elif key_press.key in (Keys.Enter, Keys.ControlM):
                                 result = sessions[selected_idx].get("id")
                                 done.set()
@@ -244,12 +309,11 @@ class SessionCommand(BaseCommand):
                                 done.set()
                                 return
             finally:
-                done.set()  # 输入流异常时也退出
+                done.set()
 
         # 启动键盘监听任务
         listener_task = asyncio.create_task(listen_keys())
 
-        # 使用 Rich Live 渲染列表
         with Live(
             build_table(),
             console=ctx.console,
@@ -257,7 +321,6 @@ class SessionCommand(BaseCommand):
             transient=True,
         ) as live:
             while not done.is_set():
-                # 等待一小段时间后刷新
                 with suppress(TimeoutError):
                     await asyncio.wait_for(done.wait(), timeout=0.1)
                 live.update(build_table())

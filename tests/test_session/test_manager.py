@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from minicode.providers.base import FunctionCall, Message, ToolCall, ToolMessage
+from minicode.providers.base import ContentBlock, FunctionCall, Message, ToolCall, ToolMessage
 from minicode.session.manager import SessionManager
 
 # 一个格式合法的、不存在的 session_id（32 位小写十六进制）
@@ -430,3 +430,102 @@ class TestSessionIdValidation:
         manager = SessionManager(tmp_path)
         with pytest.raises(ValueError, match="session_id"):
             manager.load("a" * 32 + "\r\n")
+
+
+class TestSummary:
+    """会话概要提取测试。"""
+
+    def test_summary_short_user_message(self, tmp_path: Path) -> None:
+        """第一条 user 消息 <= 15 字符时不截断。"""
+        manager = SessionManager(tmp_path)
+        session = manager.create()
+        session.messages.append(Message(role="user", content="你好世界"))
+        assert manager._compute_summary(session) == "你好世界"
+
+    def test_summary_long_user_message(self, tmp_path: Path) -> None:
+        """超过 15 字符时截断为前 15 字符 + ...."""
+        manager = SessionManager(tmp_path)
+        session = manager.create()
+        session.messages.append(
+            Message(role="user", content="这是一个非常长的用户消息，需要被截断显示")
+        )
+        assert manager._compute_summary(session) == (
+            "这是一个非常长的用户消息，需要被截断显示"[:15] + "...."
+        )
+
+    def test_summary_no_user_message(self, tmp_path: Path) -> None:
+        """没有 user 消息时 summary 为 （无概要）。"""
+        manager = SessionManager(tmp_path)
+        session = manager.create()
+        session.messages.append(Message(role="assistant", content="你好"))
+        assert manager._compute_summary(session) == "（无概要）"
+
+    def test_summary_empty_user_content(self, tmp_path: Path) -> None:
+        """user 消息 content 为空时 summary 为 （无概要）。"""
+        manager = SessionManager(tmp_path)
+        session = manager.create()
+        session.messages.append(Message(role="user", content=""))
+        assert manager._compute_summary(session) == "（无概要）"
+
+    def test_summary_content_block_list(self, tmp_path: Path) -> None:
+        """content 为 ContentBlock 列表时可以正确提取文本。"""
+        manager = SessionManager(tmp_path)
+        session = manager.create()
+        session.messages.append(Message(
+            role="user",
+            content=[
+                ContentBlock(type="text", text="Hello "),
+                ContentBlock(type="text", text="World!"),
+            ],
+        ))
+        assert manager._compute_summary(session) == "Hello World!"
+
+    def test_summary_only_first_user_message(self, tmp_path: Path) -> None:
+        """只取第一条 user 消息。"""
+        manager = SessionManager(tmp_path)
+        session = manager.create()
+        session.messages.append(Message(role="user", content="第一条"))
+        session.messages.append(Message(role="user", content="第二条"))
+        assert manager._compute_summary(session) == "第一条"
+
+    def test_save_includes_summary_in_index(self, tmp_path: Path) -> None:
+        """save 后 index.json 包含 summary 字段。"""
+        manager = SessionManager(tmp_path)
+        session = manager.create()
+        session.messages.append(Message(role="user", content="帮我修复登录问题"))
+        manager.save(session)
+
+        index = manager._load_index()
+        assert len(index) == 1
+        assert index[0]["summary"] == "帮我修复登录问题"
+
+    def test_save_summary_exactly_15_chars(self, tmp_path: Path) -> None:
+        """正好 15 字符时不截断。"""
+        manager = SessionManager(tmp_path)
+        session = manager.create()
+        text = "一二三四五六七八九零一二三四五"  # 15 chars
+        assert len(text) == 15
+        session.messages.append(Message(role="user", content=text))
+        manager.save(session)
+
+        index = manager._load_index()
+        assert index[0]["summary"] == text
+
+    def test_save_summary_over_15_chars(self, tmp_path: Path) -> None:
+        """超过 15 字符时截断并追加 ....。"""
+        manager = SessionManager(tmp_path)
+        session = manager.create()
+        session.messages.append(Message(role="user", content="这是一个超过十五个字符的测试消息"))
+        manager.save(session)
+
+        index = manager._load_index()
+        assert index[0]["summary"] == "这是一个超过十五个字符的测试消息"[:15] + "...."
+
+    def test_save_no_user_message_summary(self, tmp_path: Path) -> None:
+        """没有 user 消息时 summary 为 （无概要）。"""
+        manager = SessionManager(tmp_path)
+        session = manager.create()
+        manager.save(session)
+
+        index = manager._load_index()
+        assert index[0]["summary"] == "（无概要）"

@@ -32,6 +32,7 @@ class SessionManager:
         sessions = manager.list_sessions()
         loaded = manager.load(session.id)
         manager.delete(session.id)
+
     """
 
     def __init__(self, workspace_root: Path) -> None:
@@ -149,7 +150,8 @@ class SessionManager:
         按 updated_at 降序排列（最近更新的在前）。
 
         Returns:
-            会话摘要列表，每个元素包含 id/name/created_at/updated_at/model/provider/message_count。
+            会话摘要列表，每个元素包含 id/name/summary/created_at/updated_at/
+            model/provider/message_count。
             如果索引文件不存在或损坏，返回空列表。
         """
         index = self._load_index()
@@ -194,6 +196,37 @@ class SessionManager:
         return file_deleted or index_cleaned
 
     # ─── 内部方法 ─────────────────────────────────────────────
+
+    @staticmethod
+    def _compute_summary(session: Session) -> str:
+        """从会话消息中提取概要。
+
+        找到第一条 role == "user" 的消息，取其内容的前 15 个字符作为概要。
+
+        Args:
+            session: 会话实例。
+
+        Returns:
+            概要字符串，最多 15 个字符（超过时截断并追加 "...."）。
+        """
+        for msg in session.messages:
+            if msg.role != "user":
+                continue
+            content = msg.content
+            if content is None:
+                text = ""
+            elif isinstance(content, str):
+                text = content.strip()
+            else:
+                # ContentBlock 列表，拼接 text 块
+                parts = [b.text for b in content if b.type == "text" and b.text]
+                text = "".join(parts).strip()
+            if not text:
+                return "（无概要）"
+            if len(text) <= 15:
+                return text
+            return text[:15] + "...."
+        return "（无概要）"
 
     @staticmethod
     def _validate_session_id(session_id: str) -> None:
@@ -271,6 +304,7 @@ class SessionManager:
         summary = {
             "id": session.id,
             "name": session.name,
+            "summary": self._compute_summary(session),
             "created_at": session.created_at.isoformat(),
             "updated_at": session.updated_at.isoformat(),
             "model": session.model,
