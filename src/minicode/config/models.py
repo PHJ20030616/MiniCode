@@ -3,6 +3,7 @@
 from pydantic import BaseModel, Field
 
 from minicode.agent.context_models import ContextConfig
+from minicode.agent.planning_models import PlanningConfig
 
 
 class ProviderConfig(BaseModel):
@@ -25,6 +26,8 @@ class AgentConfig(BaseModel):
     """是否启用流式输出。"""
     context: ContextConfig = Field(default_factory=ContextConfig)
     """上下文窗口管理配置。"""
+    planning: PlanningConfig = Field(default_factory=PlanningConfig)
+    """任务规划配置。"""
 
 
 class PermissionsConfig(BaseModel):

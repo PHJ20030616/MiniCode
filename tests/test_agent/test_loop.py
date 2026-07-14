@@ -21,6 +21,7 @@ from rich.markdown import Markdown
 from rich.text import Text
 
 from minicode.agent.loop import AgentLoop
+from minicode.agent.planning_models import PlanningConfig
 from minicode.cli.confirm import ConfirmerResult
 from minicode.config.models import AgentConfig, AppConfig, PermissionsConfig, ProviderConfig
 from minicode.permissions.models import PermissionDecision
@@ -83,7 +84,11 @@ def app_config() -> AppConfig:
         default_provider="mock",
         default_model="mock-model",
         max_tokens=4096,
-        agent=AgentConfig(max_rounds=8, stream=True),
+        agent=AgentConfig(
+            max_rounds=8,
+            stream=True,
+            planning=PlanningConfig(enabled=False),
+        ),
         permissions=PermissionsConfig(trust_mode=False),
         providers={
             "mock": ProviderConfig(
@@ -1128,7 +1133,11 @@ def app_config_memory_disabled() -> AppConfig:
         default_provider="mock",
         default_model="mock-model",
         max_tokens=4096,
-        agent=AgentConfig(max_rounds=8, stream=True),
+        agent=AgentConfig(
+            max_rounds=8,
+            stream=True,
+            planning=PlanningConfig(enabled=False),
+        ),
         permissions=PermissionsConfig(trust_mode=False),
         memory=MemoryConfig(enabled=False),
         providers={
@@ -1521,3 +1530,94 @@ async def test_with_existing_history_rollback_restores_original(
     assert len(loop.messages) == history_len
     assert loop.messages[0].content == "之前的对话"
     assert loop.messages[1].content == "之前的回复"
+
+
+@pytest.mark.asyncio
+async def test_run_keeps_single_provider_call_when_planning_disabled(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """显式关闭规划模式时，保持一次 ReAct 调用行为。"""
+    app_config.agent.planning.enabled = False
+    provider = MockStepProvider([
+        [
+            StreamChunk(type="text_delta", text="完成"),
+            StreamChunk(type="done", usage=_make_usage()),
+        ]
+    ])
+
+    response, loop = await run_agent_loop(
+        provider=provider,
+        tool_registry=create_default_registry(),
+        config=app_config,
+        user_input="请回答",
+        tmp_path=tmp_path,
+    )
+
+    assert response == "完成"
+    assert provider.call_count == 1
+    assert loop.last_execution_plan is None
+
+
+@pytest.mark.asyncio
+async def test_run_creates_plan_before_react_by_default(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """默认配置下，普通任务先生成计划，再进入执行阶段。"""
+    config = app_config.model_copy(deep=True)
+    config.agent.planning = PlanningConfig()
+    provider = MockStepProvider([
+        [
+            StreamChunk(
+                type="text_delta",
+                text=(
+                    '{"goal":"修复问题","steps":['
+                    '{"title":"阅读代码","description":"定位问题。"}'
+                    "]}"
+                ),
+            ),
+            StreamChunk(type="done", usage=_make_usage()),
+        ],
+        [
+            StreamChunk(type="text_delta", text="已按计划完成"),
+            StreamChunk(type="done", usage=_make_usage()),
+        ],
+    ])
+
+    response, loop = await run_agent_loop(
+        provider=provider,
+        tool_registry=create_default_registry(),
+        config=config,
+        user_input="请修复问题",
+        tmp_path=tmp_path,
+    )
+
+    assert response == "已按计划完成"
+    assert provider.call_count == 2
+    assert loop.last_execution_plan is not None
+    assert loop.last_execution_plan.goal == "修复问题"
+    assert loop.messages[0].role == "user"
+    assert loop.messages[1].role == "assistant"
+    assert "### 执行计划" in str(loop.messages[1].content)
+    assert loop.messages[-1].content == "已按计划完成"
+
+
+@pytest.mark.asyncio
+async def test_run_rolls_back_when_planning_provider_fails(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """规划阶段失败时回滚本轮用户消息，不污染会话历史。"""
+    app_config.agent.planning.enabled = True
+    provider = MockStepProvider([[StreamChunk(type="error", text="规划失败")]])
+    loop = AgentLoop(
+        provider=provider,
+        tool_registry=create_default_registry(),
+        renderer=MagicRenderer(),  # type: ignore[arg-type]
+        config=app_config,
+        workspace_root=tmp_path,
+    )
+
+    response = await loop.run("请修复问题")
+
+    assert response is None
+    assert loop.messages == []
+    assert loop.last_execution_plan is None

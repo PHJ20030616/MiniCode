@@ -262,8 +262,9 @@ class SessionCommand(BaseCommand):
 
                 if style:
                     table.add_row(
-                        f"[reverse]{prefix} {actual_idx + 1}[/]",
-                        f"[reverse]{summary}[/]",
+                        f"{prefix} {actual_idx + 1}",
+                        summary,
+                        style=style,
                     )
                 else:
                     table.add_row(

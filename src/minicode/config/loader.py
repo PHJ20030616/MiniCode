@@ -33,6 +33,9 @@ ENV_CONFIG_MAP: dict[str, tuple[str, ...]] = {
     "MINICODE_CONTEXT_MAX_INPUT_TOKENS": ("agent", "context", "max_input_tokens"),
     "MINICODE_CONTEXT_RECENT_MESSAGES": ("agent", "context", "recent_messages"),
     "MINICODE_CONTEXT_MAX_TOOL_OUTPUT_CHARS": ("agent", "context", "max_tool_output_chars"),
+    "MINICODE_PLANNING_ENABLED": ("agent", "planning", "enabled"),
+    "MINICODE_PLANNING_MAX_STEPS": ("agent", "planning", "max_steps"),
+    "MINICODE_PLANNING_MAX_TOKENS": ("agent", "planning", "max_tokens"),
 }
 
 # 用于发现提供商环境变量的前后缀
@@ -140,6 +143,11 @@ def _get_defaults() -> dict[str, Any]:
                 "recent_messages": 16,
                 "max_tool_output_chars": 12000,
                 "keep_first_user_message": True,
+            },
+            "planning": {
+                "enabled": True,
+                "max_steps": 8,
+                "max_tokens": 2048,
             },
         },
         "permissions": {

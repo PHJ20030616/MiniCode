@@ -103,7 +103,8 @@ class TestAgentLoopSaveAndResume:
         # 3. 运行第一轮
         result1 = await loop1.run("Hi")
         assert result1 == "Hello"
-        assert len(loop1.messages) == 2  # user + assistant
+        assert len(loop1.messages) == 3  # user + plan + assistant
+        assert "### 执行计划" in str(loop1.messages[1].content)
 
         # 4. 保存会话
         session = manager.create(model="mock-model", provider="mock", workspace_root=str(tmp_path))
@@ -124,17 +125,20 @@ class TestAgentLoopSaveAndResume:
         loaded = manager.load(saved_id)
         assert loaded is not None
         loop2.messages = list(loaded.messages)
-        assert len(loop2.messages) == 2
+        assert len(loop2.messages) == 3
+        assert "### 执行计划" in str(loop2.messages[1].content)
 
         # 7. 继续一轮
         result2 = await loop2.run("Continue")
         assert result2 == "World"
 
-        # 8. 验证消息数量：2 条旧 + 2 条新 = 4 条
-        assert len(loop2.messages) == 4
+        # 8. 验证消息数量：3 条旧 + 3 条新 = 6 条
+        assert len(loop2.messages) == 6
         assert loop2.messages[0].role == "user"
         assert loop2.messages[0].content == "Hi"
-        assert loop2.messages[2].role == "user"
-        assert loop2.messages[2].content == "Continue"
-        assert loop2.messages[3].role == "assistant"
-        assert loop2.messages[3].content == "World"
+        assert loop2.messages[3].role == "user"
+        assert loop2.messages[3].content == "Continue"
+        assert loop2.messages[4].role == "assistant"
+        assert "### 执行计划" in str(loop2.messages[4].content)
+        assert loop2.messages[5].role == "assistant"
+        assert loop2.messages[5].content == "World"

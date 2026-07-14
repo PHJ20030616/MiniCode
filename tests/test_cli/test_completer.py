@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import pytest
-from prompt_toolkit.document import Document
 from prompt_toolkit.completion import CompleteEvent
+from prompt_toolkit.document import Document
 
 from minicode.cli.completer import CommandCompleter
 from minicode.commands.base import BaseCommand, CommandContext, CommandResult

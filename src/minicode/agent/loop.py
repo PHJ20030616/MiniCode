@@ -21,6 +21,8 @@ from rich.text import Text
 
 from minicode.agent.context import build_messages
 from minicode.agent.context_models import ContextBuildReport
+from minicode.agent.planner import TaskPlanner
+from minicode.agent.planning_models import ExecutionPlan
 from minicode.agent.system_prompt import build_system_prompt
 from minicode.memory.manager import MemoryManager
 from minicode.permissions.checker import check_permission
@@ -91,6 +93,7 @@ class AgentLoop:
         self.permission_confirmer = permission_confirmer
         self.messages: list[Message] = []
         self.last_context_report: ContextBuildReport | None = None
+        self.last_execution_plan: ExecutionPlan | None = None
         self._memory_enabled = config.memory.enabled
 
         # 加载记忆内容（如果启用）
@@ -128,17 +131,54 @@ class AgentLoop:
             memory_enabled=self._memory_enabled,
         )
 
-    async def run(self, user_input: str) -> str | None:
+    async def _create_execution_plan(self, user_input: str) -> ExecutionPlan:
+        """生成并展示执行计划。
+
+        规划阶段只读取当前会话历史，不执行工具；生成后的计划会作为 assistant
+        消息进入历史，使后续 ReAct 阶段可以基于该计划继续行动。
+        """
+        self.renderer.show_info("正在制定执行计划...")
+        planner = TaskPlanner(
+            provider=self.provider,
+            planning_config=self.config.agent.planning,
+            context_config=self.config.agent.context,
+            stream=self.config.agent.stream,
+        )
+        plan = await planner.create_plan(
+            messages=self.messages,
+            user_input=user_input,
+            max_tokens=self.config.max_tokens,
+        )
+        plan_markdown = plan.to_markdown()
+        self.renderer.console.print(Markdown(plan_markdown))
+        self.messages.append(Message(role="assistant", content=plan_markdown))
+        self.last_execution_plan = plan
+        return plan
+
+    async def run(self, user_input: str, *, force_plan: bool = False) -> str | None:
         """运行 ReAct 循环处理用户输入。
 
         Args:
             user_input: 用户输入文本。
+            force_plan: 是否强制本轮先生成计划，供后续命令扩展复用。
 
         Returns:
             最终回复文本。若过程中出现无法恢复的错误则返回 None。
         """
         history_len = len(self.messages)  # 记录初始长度，用于错误回滚
         self.messages.append(Message(role="user", content=user_input))
+        self.last_execution_plan = None
+
+        try:
+            if force_plan or self.config.agent.planning.enabled:
+                await self._create_execution_plan(user_input)
+        except ProviderError as e:
+            logger.debug("规划阶段失败", error=str(e))
+            self.renderer.show_error(f"计划生成失败：{e}")
+            del self.messages[history_len:]
+            self.last_execution_plan = None
+            return None
+
         logger.debug("AgentLoop 开始", max_rounds=self.config.agent.max_rounds)
 
         for round_num in range(1, self.config.agent.max_rounds + 1):
