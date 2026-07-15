@@ -26,6 +26,7 @@ from minicode.config.models import AppConfig, ProviderConfig
 from minicode.providers.registry import ProviderRegistry
 from minicode.session import Session, SessionManager
 from minicode.tools import create_default_registry
+from minicode.tools.subagent import RunSubagentTool
 from minicode.utils.exceptions import ProviderError
 from minicode.utils.log import get_logger
 
@@ -158,6 +159,26 @@ class ChatApp:
 
         permission_store = PermissionStore(self.workspace_root)
         permission_confirmer = PermissionConfirmer(console=self.console)
+
+        if self.config.agent.subagents.enabled:
+            from minicode.agent.subagents.manager import SubagentManager
+
+            subagent_manager = SubagentManager(
+                provider=provider,
+                parent_registry=tool_registry,
+                config=self.config,
+                workspace_root=self.workspace_root,
+                permission_store=permission_store,
+                permission_confirmer=permission_confirmer,
+                renderer=self.renderer,
+            )
+            tool_registry.register_factory(
+                name=RunSubagentTool.name,
+                factory=lambda: RunSubagentTool(manager=subagent_manager),
+                schema=RunSubagentTool.get_static_schema(),
+                description=RunSubagentTool.description,
+                source="runtime.subagent",
+            )
 
         # 创建 AgentLoop
         self._agent_loop = AgentLoop(

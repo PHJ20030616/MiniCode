@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from minicode.agent import AgentLoop
+from minicode.agent.subagents.models import SubagentConfig
 from minicode.cli.app import ChatApp
 from minicode.config.models import AgentConfig, AppConfig, PermissionsConfig, ProviderConfig
 from minicode.providers.base import Message
@@ -90,6 +91,30 @@ class TestGetAgentLoop:
             assert "read_file" in tool_names
             assert "glob" in tool_names
             assert "grep" in tool_names
+
+    def test_subagent_tool_disabled_by_default(self, chat_app: ChatApp) -> None:
+        """默认关闭 subagents 时不应暴露 run_subagent。"""
+        with patch(
+            "minicode.cli.app.ProviderRegistry.get",
+            return_value=MockProvider("回复"),
+        ):
+            agent_loop = chat_app._get_agent_loop()
+            assert "run_subagent" not in agent_loop.tool_registry.tool_names
+
+    def test_subagent_tool_registered_when_enabled(self, app_config: AppConfig) -> None:
+        """启用 subagents 时应向主 Agent 注册 run_subagent。"""
+        app_config.agent.subagents = SubagentConfig(enabled=True)
+        app = ChatApp(app_config)
+        with patch(
+            "minicode.cli.app.ProviderRegistry.get",
+            return_value=MockProvider("回复"),
+        ):
+            agent_loop = app._get_agent_loop()
+            tool_names = agent_loop.tool_registry.tool_names
+            tool = agent_loop.tool_registry.get_tool("run_subagent")
+
+        assert "run_subagent" in tool_names
+        assert tool.name == "run_subagent"
 
     def test_agent_loop_has_permission_store(self, chat_app: ChatApp) -> None:
         """AgentLoop 应注入 PermissionStore。"""

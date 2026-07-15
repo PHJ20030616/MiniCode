@@ -66,6 +66,18 @@ def build_system_prompt(
                 "6. 用户明确要求记住时 confidence 设为 0.9"
             )
 
+    if tool_registry.has_tool("run_subagent"):
+        prompt += (
+            "\n\n"
+            "### 子代理委派准则\n\n"
+            "当任务可以拆成边界清晰、互不依赖的检索、审查或验证工作时，可以使用 "
+            "`run_subagent` 启动子代理。\n"
+            "- 需要独立检索多个代码区域时，优先委派 researcher。\n"
+            "- 需要审查既有改动或方案风险时，优先委派 reviewer。\n"
+            "- 需要判断测试范围、验证命令或失败原因时，优先委派 tester。\n"
+            "- 不要把简单的单文件修改、需要用户决策的事项、或没有明确边界的任务委派出去。\n"
+            "- 子代理只返回结构化摘要；你需要基于摘要继续整合、修改或回复用户。"
+        )
     # 仅当记忆系统启用时才注入记忆内容
     if memory_enabled and memory_content:
         prompt += (

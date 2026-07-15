@@ -36,6 +36,25 @@ ENV_CONFIG_MAP: dict[str, tuple[str, ...]] = {
     "MINICODE_PLANNING_ENABLED": ("agent", "planning", "enabled"),
     "MINICODE_PLANNING_MAX_STEPS": ("agent", "planning", "max_steps"),
     "MINICODE_PLANNING_MAX_TOKENS": ("agent", "planning", "max_tokens"),
+    "MINICODE_SUBAGENTS_ENABLED": ("agent", "subagents", "enabled"),
+    "MINICODE_SUBAGENTS_MAX_AGENTS": ("agent", "subagents", "max_agents"),
+    "MINICODE_SUBAGENTS_CONCURRENCY": ("agent", "subagents", "concurrency"),
+    "MINICODE_SUBAGENTS_MAX_ROUNDS": ("agent", "subagents", "max_rounds"),
+    "MINICODE_SUBAGENTS_MAX_CONTEXT_TOKENS": (
+        "agent",
+        "subagents",
+        "max_context_tokens",
+    ),
+    "MINICODE_SUBAGENTS_MAX_RESULT_CHARS": (
+        "agent",
+        "subagents",
+        "max_result_chars",
+    ),
+    "MINICODE_SUBAGENTS_ALLOW_WRITE_TOOLS": (
+        "agent",
+        "subagents",
+        "allow_write_tools",
+    ),
 }
 
 # 用于发现提供商环境变量的前后缀
@@ -148,6 +167,16 @@ def _get_defaults() -> dict[str, Any]:
                 "enabled": True,
                 "max_steps": 8,
                 "max_tokens": 2048,
+            },
+            "subagents": {
+                "enabled": False,
+                "max_agents": 3,
+                "concurrency": 3,
+                "max_rounds": 8,
+                "max_context_tokens": 12000,
+                "max_result_chars": 8000,
+                "default_allowed_tools": ["read_file", "grep", "glob"],
+                "allow_write_tools": False,
             },
         },
         "permissions": {

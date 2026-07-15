@@ -10,9 +10,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from io import StringIO
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import pytest
@@ -35,6 +37,7 @@ from minicode.providers.base import (
     UsageInfo,
 )
 from minicode.tools import create_default_registry
+from minicode.tools.base import ToolResult
 from minicode.tools.registry import ToolRegistry
 from minicode.utils.exceptions import ProviderError
 
@@ -441,6 +444,220 @@ async def test_same_round_multi_tool_calls(tmp_path: Path, app_config: AppConfig
     assistant_with_tools = [m for m in loop.messages if m.role == "assistant" and m.tool_calls]
     assert len(assistant_with_tools) == 1
     assert len(assistant_with_tools[0].tool_calls) == 2  # 两个未合并
+
+
+@pytest.mark.asyncio
+async def test_consecutive_subagent_calls_run_concurrently_in_order(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """连续 run_subagent 调用应并行执行，并按原 tool_call 顺序写回。"""
+
+    class RecordingRegistry(ToolRegistry):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started: list[str] = []
+            self.release = asyncio.Event()
+
+        async def execute_tool(
+            self,
+            name: str,
+            args: dict,
+            workspace_root: Path,
+        ) -> ToolResult:
+            task_name = str(args["name"])
+            self.started.append(task_name)
+            await self.release.wait()
+            return ToolResult(success=True, output=f"结果：{task_name}")
+
+    registry = RecordingRegistry()
+    loop = AgentLoop(
+        provider=MockStepProvider([]),
+        tool_registry=registry,
+        renderer=MagicRenderer(),
+        config=app_config,
+        workspace_root=tmp_path,
+    )
+    calls = [
+        ToolCall(
+            id="call_a",
+            function=FunctionCall(
+                name="run_subagent",
+                arguments='{"name":"A","task":"任务 A"}',
+            ),
+        ),
+        ToolCall(
+            id="call_b",
+            function=FunctionCall(
+                name="run_subagent",
+                arguments='{"name":"B","task":"任务 B"}',
+            ),
+        ),
+    ]
+
+    task = asyncio.create_task(loop._execute_tools(calls))
+    for _ in range(20):
+        if registry.started == ["A", "B"]:
+            break
+        await asyncio.sleep(0.01)
+
+    assert registry.started == ["A", "B"]
+    registry.release.set()
+    await task
+
+    assert [m.tool_call_id for m in loop.messages] == ["call_a", "call_b"]
+    assert [m.content for m in loop.messages] == ["结果：A", "结果：B"]
+
+
+@pytest.mark.asyncio
+async def test_subagent_batch_is_not_serial(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """用耗时工具验证同一批 run_subagent 没有退化为串行执行。"""
+
+    class SlowRegistry(ToolRegistry):
+        async def execute_tool(
+            self,
+            name: str,
+            args: dict,
+            workspace_root: Path,
+        ) -> ToolResult:
+            await asyncio.sleep(0.05)
+            return ToolResult(success=True, output=str(args["name"]))
+
+    loop = AgentLoop(
+        provider=MockStepProvider([]),
+        tool_registry=SlowRegistry(),
+        renderer=MagicRenderer(),
+        config=app_config,
+        workspace_root=tmp_path,
+    )
+    calls = [
+        ToolCall(
+            id="call_a",
+            function=FunctionCall(
+                name="run_subagent",
+                arguments='{"name":"A","task":"任务 A"}',
+            ),
+        ),
+        ToolCall(
+            id="call_b",
+            function=FunctionCall(
+                name="run_subagent",
+                arguments='{"name":"B","task":"任务 B"}',
+            ),
+        ),
+    ]
+
+    started = perf_counter()
+    await loop._execute_tools(calls)
+
+    assert perf_counter() - started < 0.09
+
+
+@pytest.mark.asyncio
+async def test_subagent_batch_respects_concurrency_limit(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """同一批 run_subagent 调用应遵守 agent.subagents.concurrency。"""
+
+    class CountingRegistry(ToolRegistry):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active = 0
+            self.max_active = 0
+
+        async def execute_tool(
+            self,
+            name: str,
+            args: dict,
+            workspace_root: Path,
+        ) -> ToolResult:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                await asyncio.sleep(0.01)
+                return ToolResult(success=True, output=str(args["name"]))
+            finally:
+                self.active -= 1
+
+    config = app_config.model_copy(deep=True)
+    config.agent.subagents.concurrency = 1
+    registry = CountingRegistry()
+    loop = AgentLoop(
+        provider=MockStepProvider([]),
+        tool_registry=registry,
+        renderer=MagicRenderer(),
+        config=config,
+        workspace_root=tmp_path,
+    )
+    calls = [
+        ToolCall(
+            id="call_a",
+            function=FunctionCall(
+                name="run_subagent",
+                arguments='{"name":"A","task":"任务 A"}',
+            ),
+        ),
+        ToolCall(
+            id="call_b",
+            function=FunctionCall(
+                name="run_subagent",
+                arguments='{"name":"B","task":"任务 B"}',
+            ),
+        ),
+    ]
+
+    await loop._execute_tools(calls)
+
+    assert registry.max_active == 1
+    assert [m.tool_call_id for m in loop.messages] == ["call_a", "call_b"]
+
+
+@pytest.mark.asyncio
+async def test_subagent_batch_rejects_more_than_max_agents(
+    tmp_path: Path, app_config: AppConfig
+) -> None:
+    """同一轮委派超过 max_agents 时应返回中文错误且不执行工具。"""
+
+    class FailingRegistry(ToolRegistry):
+        async def execute_tool(
+            self,
+            name: str,
+            args: dict,
+            workspace_root: Path,
+        ) -> ToolResult:
+            raise AssertionError("不应执行超过 max_agents 的子代理批次")
+
+    config = app_config.model_copy(deep=True)
+    config.agent.subagents.max_agents = 1
+    loop = AgentLoop(
+        provider=MockStepProvider([]),
+        tool_registry=FailingRegistry(),
+        renderer=MagicRenderer(),
+        config=config,
+        workspace_root=tmp_path,
+    )
+    calls = [
+        ToolCall(
+            id="call_a",
+            function=FunctionCall(
+                name="run_subagent",
+                arguments='{"name":"A","task":"任务 A"}',
+            ),
+        ),
+        ToolCall(
+            id="call_b",
+            function=FunctionCall(
+                name="run_subagent",
+                arguments='{"name":"B","task":"任务 B"}',
+            ),
+        ),
+    ]
+
+    await loop._execute_tools(calls)
+
+    assert [m.tool_call_id for m in loop.messages] == ["call_a", "call_b"]
+    assert all("最多允许启动 1 个子代理" in (m.content or "") for m in loop.messages)
 
 
 # ─── Test 4: 工具错误返回给模型 ────────────────────────────────────

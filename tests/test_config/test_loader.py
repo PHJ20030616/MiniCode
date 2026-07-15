@@ -357,6 +357,27 @@ class TestEnvVarOverride:
         assert config.agent.max_rounds == 10
         assert config.agent.stream is False
 
+    def test_env_subagent_settings(self, fake_home: Path, monkeypatch) -> None:
+        """验证环境变量可以覆盖 subagent 配置。"""
+        monkeypatch.setenv("MINICODE_SUBAGENTS_ENABLED", "true")
+        monkeypatch.setenv("MINICODE_SUBAGENTS_MAX_AGENTS", "4")
+        monkeypatch.setenv("MINICODE_SUBAGENTS_CONCURRENCY", "2")
+        monkeypatch.setenv("MINICODE_SUBAGENTS_MAX_ROUNDS", "6")
+        monkeypatch.setenv("MINICODE_SUBAGENTS_MAX_CONTEXT_TOKENS", "9000")
+        monkeypatch.setenv("MINICODE_SUBAGENTS_MAX_RESULT_CHARS", "3000")
+        monkeypatch.setenv("MINICODE_SUBAGENTS_ALLOW_WRITE_TOOLS", "true")
+        monkeypatch.setenv("MINICODE_DEEPSEEK_API_KEY", "sk-key")
+
+        config = load()
+
+        assert config.agent.subagents.enabled is True
+        assert config.agent.subagents.max_agents == 4
+        assert config.agent.subagents.concurrency == 2
+        assert config.agent.subagents.max_rounds == 6
+        assert config.agent.subagents.max_context_tokens == 9000
+        assert config.agent.subagents.max_result_chars == 3000
+        assert config.agent.subagents.allow_write_tools is True
+
     def test_env_context_max_input_tokens(self, fake_home: Path, monkeypatch) -> None:
         """验证 MINICODE_CONTEXT_MAX_INPUT_TOKENS 被正确解析为 int。"""
         monkeypatch.setenv("MINICODE_CONTEXT_MAX_INPUT_TOKENS", "32000")

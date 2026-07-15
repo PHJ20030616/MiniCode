@@ -35,7 +35,7 @@ def registry_with_tools() -> ToolRegistry:
             return ToolResult(success=True)
 
     reg = ToolRegistry()
-    reg._tools["test_tool"] = TestTool()
+    reg.register_tool(TestTool())
     return reg
 
 
@@ -60,8 +60,8 @@ def registry_with_both() -> ToolRegistry:
             return ToolResult(success=True)
 
     reg = ToolRegistry()
-    reg._tools["test_tool"] = TestTool()
-    reg._tools["remember"] = MockRemember()
+    reg.register_tool(TestTool())
+    reg.register_tool(MockRemember())
     return reg
 
 
@@ -78,7 +78,7 @@ def registry_with_remember() -> ToolRegistry:
             return ToolResult(success=True)
 
     reg = ToolRegistry()
-    reg._tools["remember"] = MockRemember()
+    reg.register_tool(MockRemember())
     return reg
 
 

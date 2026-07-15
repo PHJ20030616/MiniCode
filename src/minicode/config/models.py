@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 
 from minicode.agent.context_models import ContextConfig
 from minicode.agent.planning_models import PlanningConfig
+from minicode.agent.subagents.models import SubagentConfig
 
 
 class ProviderConfig(BaseModel):
@@ -28,6 +29,8 @@ class AgentConfig(BaseModel):
     """上下文窗口管理配置。"""
     planning: PlanningConfig = Field(default_factory=PlanningConfig)
     """任务规划配置。"""
+    subagents: SubagentConfig = Field(default_factory=SubagentConfig)
+    """Subagent 编排配置。"""
 
 
 class PermissionsConfig(BaseModel):
@@ -59,7 +62,7 @@ class AppConfig(BaseModel):
             "deepseek": ProviderConfig(
                 api_key="",
                 base_url="https://api.deepseek.com",
-                models=["deepseek-v4-flash","deepseek-v4-pro"],
+                models=["deepseek-v4-flash", "deepseek-v4-pro"],
             ),
         }
     )

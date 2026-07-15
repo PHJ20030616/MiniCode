@@ -94,6 +94,22 @@ class HelperToolErrorTool(BaseTool):
         raise ToolError(msg)
 
 
+class TrackingWorkspaceTool(BaseTool):
+    """记录实际执行实例的 workspace_root，用于验证工厂化隔离。"""
+
+    name: str = "tracking_workspace"
+    description: str = "记录执行工作区"
+    parameters: dict = {
+        "type": "object",
+        "properties": {},
+    }
+    seen_roots: list[Path | None] = []
+
+    async def execute(self, **kwargs: object) -> ToolResult:
+        self.__class__.seen_roots.append(self.workspace_root)
+        return ToolResult(success=True, output="ok")
+
+
 class TestToolRegistry:
     """ToolRegistry 核心功能测试。"""
 
@@ -119,7 +135,32 @@ class TestToolRegistry:
         registry = ToolRegistry()
         tool = HelperTool()
         registry.register_tool(tool)
-        assert registry.get_tool("test_tool") is tool
+        registered = registry.get_tool("test_tool")
+        assert isinstance(registered, HelperTool)
+        assert registered is not tool
+        assert registered.name == tool.name
+
+    def test_get_tool_returns_new_instance_each_time(self) -> None:
+        registry = ToolRegistry()
+        registry.register(HelperTool)
+
+        first = registry.get_tool("test_tool")
+        second = registry.get_tool("test_tool")
+
+        assert isinstance(first, HelperTool)
+        assert isinstance(second, HelperTool)
+        assert first is not second
+
+    def test_scope_keeps_selected_descriptors(self) -> None:
+        registry = ToolRegistry()
+        registry.register(HelperTool)
+        registry.register(HelperEchoTool)
+
+        scoped = registry.scope(["echo"])
+
+        assert scoped.tool_names == ["echo"]
+        assert scoped.has_tool("echo") is True
+        assert scoped.has_tool("test_tool") is False
 
     def test_has_tool(self) -> None:
         registry = ToolRegistry()
@@ -195,11 +236,14 @@ class TestToolExecution:
     @pytest.mark.asyncio
     async def test_execute_tool_injects_workspace(self, tmp_path: Path) -> None:
         registry = ToolRegistry()
-        registry.register(HelperTool)
+        TrackingWorkspaceTool.seen_roots.clear()
+        registry.register(TrackingWorkspaceTool)
 
-        await registry.execute_tool("test_tool", {"msg": "hello"}, tmp_path)
-        tool = registry.get_tool("test_tool")
-        assert tool.workspace_root == tmp_path
+        await registry.execute_tool("tracking_workspace", {}, tmp_path)
+        fresh_tool = registry.get_tool("tracking_workspace")
+
+        assert TrackingWorkspaceTool.seen_roots == [tmp_path]
+        assert fresh_tool.workspace_root is None
 
     @pytest.mark.asyncio
     async def test_execute_unregistered_raises(self, tmp_path: Path) -> None:

@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 from collections import defaultdict
@@ -94,6 +95,7 @@ class AgentLoop:
         self.messages: list[Message] = []
         self.last_context_report: ContextBuildReport | None = None
         self.last_execution_plan: ExecutionPlan | None = None
+        self._subagents_started_this_run = 0
         self._memory_enabled = config.memory.enabled
 
         # 加载记忆内容（如果启用）
@@ -168,6 +170,7 @@ class AgentLoop:
         history_len = len(self.messages)  # 记录初始长度，用于错误回滚
         self.messages.append(Message(role="user", content=user_input))
         self.last_execution_plan = None
+        self._subagents_started_this_run = 0
 
         try:
             if force_plan or self.config.agent.planning.enabled:
@@ -379,79 +382,153 @@ class AgentLoop:
         return tool_calls
 
     async def _execute_tools(self, tool_calls: list[ToolCall]) -> None:
-        """串行执行工具调用，并将结果追加到对话历史。
+        """执行工具调用，并将结果追加到对话历史。
 
-        在工具执行前进行权限检查：
-        - safe 级别直接执行
-        - deny 级别不执行，追加拒绝信息
-        - caution/dangerous 级别根据 trust_mode、store、confirmer 决策
-
-        Args:
-            tool_calls: 模型返回的工具调用列表。
+        普通工具保持串行执行，避免改变权限确认和写操作的既有语义；同一轮中连续的
+        run_subagent 调用会并行执行，并在全部完成后按原 tool_call 顺序写回。
         """
-        for tc in tool_calls:
-            name = tc.function.name
-            try:
-                args = json.loads(tc.function.arguments) if tc.function.arguments else {}
-            except json.JSONDecodeError as e:
-                logger.debug("工具参数解析失败", tool=name, error=str(e))
-                self.messages.append(
-                    ToolMessage(
+        index = 0
+        while index < len(tool_calls):
+            tc = tool_calls[index]
+            if tc.function.name == "run_subagent":
+                batch: list[ToolCall] = []
+                while (
+                    index < len(tool_calls)
+                    and tool_calls[index].function.name == "run_subagent"
+                ):
+                    batch.append(tool_calls[index])
+                    index += 1
+                await self._execute_subagent_batch(batch)
+                continue
+
+            await self._execute_single_tool(tc)
+            index += 1
+
+    async def _execute_subagent_batch(self, tool_calls: list[ToolCall]) -> None:
+        """并行执行一组连续的 run_subagent 调用，按原始顺序追加 ToolMessage。"""
+        if not tool_calls:
+            return
+
+        subagent_config = self.config.agent.subagents
+        remaining_agents = subagent_config.max_agents - self._subagents_started_this_run
+        if len(tool_calls) > remaining_agents:
+            error = (
+                f"本轮最多允许启动 {subagent_config.max_agents} 个子代理，"
+                f"当前请求 {len(tool_calls)} 个，剩余额度 {max(remaining_agents, 0)} 个。"
+            )
+            self.renderer.show_error(error)
+            self.messages.extend(
+                ToolMessage(content=error, tool_call_id=tc.id, name=tc.function.name)
+                for tc in tool_calls
+            )
+            return
+        self._subagents_started_this_run += len(tool_calls)
+
+        self.renderer.console.print(Text("\n── 正在并行启动子代理 ──", style="dim"))
+        semaphore = asyncio.Semaphore(subagent_config.concurrency)
+
+        async def _run(tc: ToolCall) -> ToolMessage:
+            async with semaphore:
+                name = tc.function.name
+                try:
+                    args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                except json.JSONDecodeError as e:
+                    logger.debug("子代理参数解析失败", tool=name, error=str(e))
+                    return ToolMessage(
                         content=f"参数解析错误：{e}",
                         tool_call_id=tc.id,
                         name=name,
                     )
-                )
-                continue
 
-            # 权限检查：工具执行前调用 check_permission()
-            if await self._check_tool_permission(name, args, tc):
-                # 返回 True 表示已拒绝，跳过执行
-                continue
-
-            # memory 禁用时拒绝 remember 工具（防御层）
-            if name == "remember" and not self._memory_enabled:
-                logger.debug("记忆系统已禁用，拒绝 remember 工具调用")
-                self.messages.append(
-                    ToolMessage(
-                        content="记忆系统已禁用，无法保存记忆。",
+                try:
+                    result = await self.tool_registry.execute_tool(
+                        name=name,
+                        args=args,
+                        workspace_root=self.workspace_root,
+                    )
+                except Exception as e:
+                    logger.debug("子代理工具执行异常", tool=name, error=str(e), exc_info=True)
+                    return ToolMessage(
+                        content=f"子代理执行失败：{e}",
                         tool_call_id=tc.id,
                         name=name,
                     )
-                )
-                continue
 
-            logger.debug("执行工具", tool=name, args=args)
-            self.renderer.console.print(
-                Text(f"\n── 正在调用工具：{name} ──", style="dim")
-            )
-
-            result = await self.tool_registry.execute_tool(
-                name=name,
-                args=args,
-                workspace_root=self.workspace_root,
-            )
-
-            log_msg = f"工具 '{name}' 执行{'成功' if result.success else '失败'}"
-            logger.debug(log_msg, output_length=len(result.output))
-
-            if result.success:
-                self.renderer.show_info(f"工具执行成功（{len(result.output)} 字符）")
-            else:
-                error_detail = result.error or result.output
-                self.renderer.show_error(f"工具执行失败：{name} — {error_detail[:200]}")
-
-            # remember 工具成功执行后刷新系统提示词
-            if name == "remember" and result.success and self._memory_enabled:
-                self.reload_memory()
-
-            self.messages.append(
-                ToolMessage(
+                if result.success:
+                    self.renderer.show_info(f"子代理执行完成（{len(result.output)} 字符）")
+                else:
+                    error_detail = result.error or result.output
+                    self.renderer.show_error(f"子代理执行失败：{error_detail[:200]}")
+                return ToolMessage(
                     content=result.output,
                     tool_call_id=tc.id,
                     name=name,
                 )
+
+        messages = await asyncio.gather(*(_run(tc) for tc in tool_calls))
+        self.messages.extend(messages)
+
+    async def _execute_single_tool(self, tc: ToolCall) -> None:
+        """按原有串行语义执行一个普通工具调用。"""
+        name = tc.function.name
+        try:
+            args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+        except json.JSONDecodeError as e:
+            logger.debug("工具参数解析失败", tool=name, error=str(e))
+            self.messages.append(
+                ToolMessage(
+                    content=f"参数解析错误：{e}",
+                    tool_call_id=tc.id,
+                    name=name,
+                )
             )
+            return
+
+        # 权限检查：工具执行前调用 check_permission()
+        if await self._check_tool_permission(name, args, tc):
+            return
+
+        # memory 禁用时拒绝 remember 工具（防御层）
+        if name == "remember" and not self._memory_enabled:
+            logger.debug("记忆系统已禁用，拒绝 remember 工具调用")
+            self.messages.append(
+                ToolMessage(
+                    content="记忆系统已禁用，无法保存记忆。",
+                    tool_call_id=tc.id,
+                    name=name,
+                )
+            )
+            return
+
+        logger.debug("执行工具", tool=name, args=args)
+        self.renderer.console.print(Text(f"\n── 正在调用工具：{name} ──", style="dim"))
+
+        result = await self.tool_registry.execute_tool(
+            name=name,
+            args=args,
+            workspace_root=self.workspace_root,
+        )
+
+        log_msg = f"工具 '{name}' 执行{'成功' if result.success else '失败'}"
+        logger.debug(log_msg, output_length=len(result.output))
+
+        if result.success:
+            self.renderer.show_info(f"工具执行成功（{len(result.output)} 字符）")
+        else:
+            error_detail = result.error or result.output
+            self.renderer.show_error(f"工具执行失败：{name} — {error_detail[:200]}")
+
+        # remember 工具成功执行后刷新系统提示词
+        if name == "remember" and result.success and self._memory_enabled:
+            self.reload_memory()
+
+        self.messages.append(
+            ToolMessage(
+                content=result.output,
+                tool_call_id=tc.id,
+                name=name,
+            )
+        )
 
     async def _check_tool_permission(
         self,
@@ -477,6 +554,9 @@ class AgentLoop:
         Returns:
             True 表示不应执行工具，False 表示可以执行。
         """
+        if tool_name == "run_subagent":
+            return False
+
         decision = check_permission(
             tool_name=tool_name,
             arguments=arguments,

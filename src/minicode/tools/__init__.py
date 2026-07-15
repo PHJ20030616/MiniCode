@@ -12,6 +12,7 @@ from minicode.tools.grep import GrepFiles
 from minicode.tools.registry import ToolRegistry
 from minicode.tools.remember import Remember
 from minicode.tools.shell import ShellTool
+from minicode.tools.subagent import RunSubagentTool
 
 
 def register_builtin_tools(registry: ToolRegistry) -> None:
@@ -39,6 +40,7 @@ __all__ = [
     "GrepFiles",
     "ReadFile",
     "Remember",
+    "RunSubagentTool",
     "ShellTool",
     "ToolRegistry",
     "ToolResult",

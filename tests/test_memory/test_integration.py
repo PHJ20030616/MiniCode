@@ -31,7 +31,7 @@ def registry_with_tools() -> ToolRegistry:
             return ToolResult(success=True)
 
     reg = ToolRegistry()
-    reg._tools["test_tool"] = TestTool()
+    reg.register_tool(TestTool())
     return reg
 
 
