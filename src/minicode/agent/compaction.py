@@ -20,10 +20,15 @@ class AtomicMessageGroup:
 
 
 def _has_unconsumed_tool_result(messages: list[Message]) -> bool:
-    return any(
-        isinstance(message, ToolMessage) and not message.consumed_by_main_model
-        for message in messages
-    )
+    for message in messages:
+        if message.role != "tool":
+            continue
+        # 普通 Message 没有消费状态；为避免误压缩，保守地按未消费处理。
+        if not isinstance(message, ToolMessage):
+            return True
+        if not message.consumed_by_main_model:
+            return True
+    return False
 
 
 def build_atomic_groups(messages: list[Message]) -> list[AtomicMessageGroup]:
@@ -135,7 +140,21 @@ def validate_tool_protocol(messages: list[Message]) -> None:
 
         pending_call_ids = None
         if message.role == "assistant" and message.tool_calls:
-            pending_call_ids = {tool_call.id for tool_call in message.tool_calls}
+            call_ids: set[str] = set()
+            for call_index, tool_call in enumerate(message.tool_calls, start=1):
+                call_id = tool_call.id
+                if not call_id.strip():
+                    raise ValueError(
+                        f"工具调用 ID 不能为空：索引 {index} 的 assistant "
+                        f"第 {call_index} 个工具调用使用了空 ID。"
+                    )
+                if call_id in call_ids:
+                    raise ValueError(
+                        f"工具调用 ID 重复：索引 {index} 的 assistant "
+                        f"包含重复 ID {call_id!r}。"
+                    )
+                call_ids.add(call_id)
+            pending_call_ids = call_ids
 
     if pending_call_ids:
         missing_ids = ", ".join(sorted(pending_call_ids))

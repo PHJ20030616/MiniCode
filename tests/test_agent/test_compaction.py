@@ -157,6 +157,27 @@ def test_select_protected_suffix_expands_to_earliest_unconsumed_group() -> None:
     assert select_protected_suffix_start(messages, recent_budget=1) == 1
 
 
+def test_select_protected_suffix_treats_generic_tool_message_as_unconsumed() -> None:
+    tool_result = Message(
+        role="tool",
+        content="消费状态未知",
+        tool_call_id="call_pending",
+        name="read_file",
+    )
+    messages = [
+        Message(role="user", content="可丢弃"),
+        _assistant_with_tools(("call_pending", "read_file")),
+        tool_result,
+        Message(role="assistant", content="中间回复"),
+        Message(role="user", content="最新消息"),
+    ]
+    original_snapshot = [message.model_dump() for message in messages]
+
+    assert select_protected_suffix_start(messages, recent_budget=1) == 1
+    assert not hasattr(tool_result, "consumed_by_main_model")
+    assert [message.model_dump() for message in messages] == original_snapshot
+
+
 def test_select_protected_suffix_empty_messages_returns_zero() -> None:
     assert select_protected_suffix_start([], recent_budget=100) == 0
 
@@ -238,8 +259,36 @@ def test_validate_tool_protocol_accepts_complete_multi_tool_exchange() -> None:
     validate_tool_protocol(messages)
 
 
-def test_validate_tool_protocol_rejects_orphan_tool_result() -> None:
+def test_validate_tool_protocol_rejects_duplicate_call_ids() -> None:
     messages = [
+        _assistant_with_tools(
+            ("call_duplicate", "read_file"),
+            ("call_duplicate", "grep"),
+        ),
+        ToolMessage(
+            content="single result",
+            tool_call_id="call_duplicate",
+            name="read_file",
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="工具调用 ID 重复"):
+        validate_tool_protocol(messages)
+
+
+@pytest.mark.parametrize("call_id", ["", "   "])
+def test_validate_tool_protocol_rejects_empty_call_id(call_id: str) -> None:
+    messages = [
+        _assistant_with_tools((call_id, "read_file")),
+        ToolMessage(content="result", tool_call_id=call_id, name="read_file"),
+    ]
+
+    with pytest.raises(ValueError, match="工具调用 ID 不能为空"):
+        validate_tool_protocol(messages)
+
+
+def test_validate_tool_protocol_rejects_orphan_tool_result() -> None:
+    messages: list[Message] = [
         ToolMessage(content="orphan", tool_call_id="call_read", name="read_file"),
     ]
 
