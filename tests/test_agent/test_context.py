@@ -10,7 +10,14 @@ from __future__ import annotations
 
 import pytest
 
-from minicode.agent.context import _compress_text, _drop_old_messages_to_budget, build_messages
+from minicode.agent.context import (
+    _compress_text,
+    _drop_old_messages_to_budget,
+    build_messages,
+    build_strict_messages,
+    estimate_context_usage,
+    serialize_tools_schema,
+)
 from minicode.agent.context_models import ContextBuildReport, ContextBuildResult, ContextConfig
 from minicode.agent.token_estimator import (
     CHARS_PER_TOKEN,
@@ -20,6 +27,7 @@ from minicode.agent.token_estimator import (
     estimate_tokens,
 )
 from minicode.providers.base import FunctionCall, Message, ToolCall, ToolMessage
+from minicode.utils.exceptions import ContextWindowExceededError
 
 # ============================================================
 # 词元估算器测试
@@ -665,3 +673,110 @@ class TestBuildMessages:
         assert len(result.messages) == 1
         assert result.messages[0].role == "system"
         assert result.messages[0].content == "sys"
+
+
+class TestStrictContext:
+    """主 Agent 严格上下文组装测试。"""
+
+    def test_serialize_tools_schema_has_stable_key_order(self) -> None:
+        """工具 schema 的字典键顺序不影响序列化结果。"""
+        first = [{"type": "function", "function": {"name": "read", "strict": True}}]
+        second = [{"function": {"strict": True, "name": "read"}, "type": "function"}]
+
+        assert serialize_tools_schema(first) == serialize_tools_schema(second)
+        assert serialize_tools_schema(first) == (
+            '[{"function":{"name":"read","strict":true},"type":"function"}]'
+        )
+
+    def test_estimate_usage_includes_system_history_and_tools(self) -> None:
+        """用量报告分别统计 system、历史与工具 schema。"""
+        messages = [
+            Message(role="user", content="hello"),
+            ToolMessage(
+                content="pending",
+                tool_call_id="call_1",
+                name="read",
+            ),
+            ToolMessage(
+                content="consumed",
+                tool_call_id="call_2",
+                name="grep",
+                consumed_by_main_model=True,
+            ),
+            Message(
+                role="tool",
+                content="generic",
+                tool_call_id="call_3",
+                name="shell",
+            ),
+        ]
+        system_prompt = "system prompt"
+        tools_schema = [{"type": "function", "function": {"name": "read"}}]
+
+        usage = estimate_context_usage(
+            messages,
+            system_prompt,
+            tools_schema,
+            max_input_tokens=1000,
+        )
+
+        expected_system = estimate_message_tokens(
+            Message(role="system", content=system_prompt)
+        )
+        expected_messages = estimate_messages_tokens(messages)
+        expected_tools = estimate_tokens(serialize_tools_schema(tools_schema))
+        expected_total = expected_system + expected_messages + expected_tools
+        assert usage.system_tokens == expected_system
+        assert usage.message_tokens == expected_messages
+        assert usage.tools_tokens == expected_tools
+        assert usage.estimated_tokens == expected_total
+        assert usage.occupancy_ratio == expected_total / 1000
+        assert usage.message_count == len(messages)
+        assert usage.unconsumed_tool_result_count == 1
+
+    def test_build_strict_messages_preserves_long_tool_output(self) -> None:
+        """严格组装完整保留 20k 工具正文。"""
+        long_output = "X" * 20000
+        messages = [
+            ToolMessage(
+                content=long_output,
+                tool_call_id="call_1",
+                name="read_file",
+            )
+        ]
+
+        result = build_strict_messages(
+            messages,
+            "sys",
+            [],
+            ContextConfig(max_input_tokens=10000, max_tool_output_chars=100),
+        )
+
+        assert result.messages[1] is messages[0]
+        assert result.messages[1].content == long_output
+        assert len(result.messages[1].content or "") == 20000
+
+    def test_build_strict_messages_raises_without_mutating_input(self) -> None:
+        """超限时抛出异常，且输入消息保持原样。"""
+        messages = [
+            Message(role="user", content="first"),
+            ToolMessage(
+                content="X" * 20000,
+                tool_call_id="call_1",
+                name="read_file",
+            ),
+        ]
+        original_snapshot = [message.model_dump() for message in messages]
+
+        with pytest.raises(
+            ContextWindowExceededError,
+            match="超过模型输入上限",
+        ):
+            build_strict_messages(
+                messages,
+                "sys",
+                [],
+                ContextConfig(max_input_tokens=100),
+            )
+
+        assert [message.model_dump() for message in messages] == original_snapshot

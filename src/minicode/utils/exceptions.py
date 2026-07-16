@@ -13,6 +13,10 @@ class MiniCodeError(Exception):
     """
 
 
+class ContextWindowExceededError(MiniCodeError):
+    """严格上下文超过模型输入窗口时抛出的异常。"""
+
+
 class ConfigError(MiniCodeError):
     """配置相关的错误。
 

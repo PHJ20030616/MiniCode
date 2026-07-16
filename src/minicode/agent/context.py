@@ -6,16 +6,97 @@
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 
-from minicode.agent.token_estimator import estimate_messages_tokens
-from minicode.providers.base import Message
+from minicode.agent.token_estimator import (
+    estimate_message_tokens,
+    estimate_messages_tokens,
+    estimate_tokens,
+)
+from minicode.providers.base import Message, ToolMessage
+from minicode.utils.exceptions import ContextWindowExceededError
 
 if TYPE_CHECKING:
-    from minicode.agent.context_models import ContextBuildResult, ContextConfig
+    from minicode.agent.context_models import (
+        ContextBuildResult,
+        ContextConfig,
+        ContextUsageReport,
+        StrictContextBuildResult,
+    )
 
 # 固定长度截断标记 —— 不含动态省略计数，确保 len(result) <= max_chars
 _TRUNCATION_MARKER = "\n\n[中间内容已截断]\n\n"
+
+
+def serialize_tools_schema(tools_schema: list[dict[str, object]]) -> str:
+    """将工具 schema 序列化为稳定且紧凑的 JSON。"""
+    return json.dumps(
+        tools_schema,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def estimate_context_usage(
+    messages: list[Message],
+    system_prompt: str,
+    tools_schema: list[dict[str, object]],
+    max_input_tokens: int,
+) -> ContextUsageReport:
+    """估算严格上下文中 system、历史消息与工具 schema 的用量。"""
+    from minicode.agent.context_models import ContextUsageReport
+
+    system_message = Message(role="system", content=system_prompt)
+    system_tokens = estimate_message_tokens(system_message)
+    message_tokens = estimate_messages_tokens(messages)
+    tools_tokens = estimate_tokens(serialize_tools_schema(tools_schema))
+    estimated_tokens = system_tokens + message_tokens + tools_tokens
+    unconsumed_tool_result_count = sum(
+        1
+        for message in messages
+        if isinstance(message, ToolMessage)
+        and not message.consumed_by_main_model
+    )
+    return ContextUsageReport(
+        estimated_tokens=estimated_tokens,
+        max_input_tokens=max_input_tokens,
+        occupancy_ratio=estimated_tokens / max_input_tokens,
+        message_count=len(messages),
+        system_tokens=system_tokens,
+        message_tokens=message_tokens,
+        tools_tokens=tools_tokens,
+        unconsumed_tool_result_count=unconsumed_tool_result_count,
+    )
+
+
+def build_strict_messages(
+    messages: list[Message],
+    system_prompt: str,
+    tools_schema: list[dict[str, object]],
+    context_config: ContextConfig,
+) -> StrictContextBuildResult:
+    """构建不裁剪、不压缩历史消息的主 Agent 严格上下文。"""
+    from minicode.agent.context_models import StrictContextBuildResult
+
+    usage = estimate_context_usage(
+        messages,
+        system_prompt,
+        tools_schema,
+        context_config.max_input_tokens,
+    )
+    if usage.estimated_tokens > usage.max_input_tokens:
+        raise ContextWindowExceededError(
+            "上下文估算词元数"
+            f" {usage.estimated_tokens} 超过模型输入上限"
+            f" {usage.max_input_tokens}"
+        )
+
+    return StrictContextBuildResult(
+        messages=[Message(role="system", content=system_prompt), *messages],
+        report=usage,
+    )
 
 
 def _compress_text(text: str, max_chars: int) -> tuple[str, bool]:
