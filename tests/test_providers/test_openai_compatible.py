@@ -15,7 +15,7 @@ from typing import Any
 import openai
 import pytest
 
-from minicode.providers.base import Message, ToolCall
+from minicode.providers.base import Message, ToolCall, ToolMessage
 from minicode.providers.openai_compatible import OpenAICompatibleProvider, _convert_messages
 from minicode.providers.registry import ProviderRegistry
 from minicode.utils.exceptions import ProviderError
@@ -937,6 +937,32 @@ def mocker_async_raise(exc: Exception) -> Any:
 
 class TestConvertMessages:
     """验证 _convert_messages 正确转换内部消息为 OpenAI 格式。"""
+
+    def test_internal_message_fields_are_not_sent_to_openai(self) -> None:
+        """内部消息状态不应进入 Provider payload。"""
+        messages = [
+            Message(role="user", content="历史摘要", kind="compact_summary"),
+            ToolMessage(
+                content="文件正文",
+                tool_call_id="call_read",
+                name="read_file",
+                consumed_by_main_model=True,
+            ),
+        ]
+
+        result = _convert_messages(messages)
+
+        assert result == [
+            {"role": "user", "content": "历史摘要"},
+            {
+                "role": "tool",
+                "content": "文件正文",
+                "tool_call_id": "call_read",
+                "name": "read_file",
+            },
+        ]
+        assert all("kind" not in payload for payload in result)
+        assert all("consumed_by_main_model" not in payload for payload in result)
 
     def test_user_message(self) -> None:
         """用户消息应转换为 {'role': 'user', 'content': '...'}。"""

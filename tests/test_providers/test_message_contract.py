@@ -16,6 +16,37 @@ from typing import Any
 
 from minicode.providers.base import ContentBlock, FunctionCall, Message, ToolCall, ToolMessage
 
+
+class TestInternalMessageState:
+    """验证上下文压缩相关的内部消息状态。"""
+
+    def test_message_accepts_compact_summary_kind(self) -> None:
+        """历史摘要消息应能标记为 compact_summary。"""
+        message = Message(role="user", content="历史摘要", kind="compact_summary")
+
+        assert message.kind == "compact_summary"
+
+    def test_tool_message_is_unconsumed_by_default(self) -> None:
+        """工具消息默认应尚未被主模型消费。"""
+        message = ToolMessage(
+            content="文件正文",
+            tool_call_id="call_read",
+            name="read_file",
+        )
+
+        assert message.consumed_by_main_model is False
+
+    def test_tool_message_accepts_consumed_state(self) -> None:
+        """工具消息应允许显式标记为已被主模型消费。"""
+        message = ToolMessage(
+            content="文件正文",
+            tool_call_id="call_read",
+            name="read_file",
+            consumed_by_main_model=True,
+        )
+
+        assert message.consumed_by_main_model is True
+
 # ─── 辅助转换函数（仅用于 contract test，非真实 Provider 实现） ───
 
 def _convert_to_anthropic(messages: list[Message]) -> dict[str, Any]:

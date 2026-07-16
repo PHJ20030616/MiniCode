@@ -65,6 +65,7 @@ class Message(BaseModel):
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
     name: str | None = None
+    kind: Literal["compact_summary"] | None = None
 
 
 class ToolMessage(Message):
@@ -84,6 +85,7 @@ class ToolMessage(Message):
     content: str | None = None
     tool_call_id: str  # type: ignore[assignment]  # 必填，覆盖父类的可选字段
     tool_calls: None = None  # type: ignore[assignment]  # tool 消息不含 tool_calls
+    consumed_by_main_model: bool = False
 
 
 class PartialToolCall(BaseModel):
