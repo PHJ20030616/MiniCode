@@ -28,6 +28,7 @@ CLAUDE.md
 
 # codex
 .codex/
+.worktrees/
 
 # IDE
 .vscode/
