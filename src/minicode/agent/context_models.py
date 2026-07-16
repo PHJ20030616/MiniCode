@@ -5,9 +5,56 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from datetime import datetime
+from enum import StrEnum
+from typing import Self
+
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from minicode.providers.base import Message
+
+DEFAULT_CLEANUP_TOOLS = ["read_file", "grep", "glob", "shell"]
+
+
+class CompactionTrigger(StrEnum):
+    """上下文压缩的触发方式。"""
+
+    AUTOMATIC = "automatic"
+    MANUAL = "manual"
+
+
+class CompactionConfig(BaseModel):
+    """上下文压缩配置。"""
+
+    auto_enabled: bool = True
+    trigger_ratio: float = Field(default=0.90, gt=0, lt=1)
+    target_ratio: float = Field(default=0.60, gt=0, lt=1)
+    summary_max_tokens: int = Field(default=2048, gt=0)
+    cleanup_tools: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_CLEANUP_TOOLS)
+    )
+
+    @field_validator("cleanup_tools")
+    @classmethod
+    def normalize_cleanup_tools(cls, cleanup_tools: list[str]) -> list[str]:
+        """清理工具名称去除空白，并保持首次出现顺序去重。"""
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for tool_name in cleanup_tools:
+            stripped_name = tool_name.strip()
+            if not stripped_name:
+                raise ValueError("清理工具名称不能为空")
+            if stripped_name not in seen:
+                normalized.append(stripped_name)
+                seen.add(stripped_name)
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_target_ratio(self) -> Self:
+        """目标占用率必须严格低于触发占用率。"""
+        if self.target_ratio >= self.trigger_ratio:
+            raise ValueError("目标占用率必须严格小于触发占用率")
+        return self
 
 
 class ContextConfig(BaseModel):
@@ -27,6 +74,8 @@ class ContextConfig(BaseModel):
     """单条工具输出压缩阈值，必须大于 0。"""
     keep_first_user_message: bool = True
     """是否保留首条用户消息。"""
+    compaction: CompactionConfig = Field(default_factory=CompactionConfig)
+    """上下文压缩配置。"""
 
 
 class ContextBuildReport(BaseModel):
@@ -60,3 +109,48 @@ class ContextBuildResult(BaseModel):
     """构建后的消息列表（已压缩和裁剪）。"""
     report: ContextBuildReport
     """构建报告。"""
+
+
+class ContextUsageReport(BaseModel):
+    """严格上下文构建的用量报告。"""
+
+    estimated_tokens: int
+    max_input_tokens: int
+    occupancy_ratio: float
+    message_count: int
+    system_tokens: int
+    message_tokens: int
+    tools_tokens: int
+    unconsumed_tool_result_count: int
+
+
+class CompactionReport(BaseModel):
+    """一次上下文压缩的执行报告。"""
+
+    trigger: CompactionTrigger
+    created_at: datetime
+    before_tokens: int
+    after_tokens: int
+    before_message_count: int
+    after_message_count: int
+    summarized_message_count: int
+    cleared_tool_result_count: int
+    unconsumed_tool_result_count: int
+    retry_used: bool
+    target_reached: bool
+    focus_provided: bool
+
+
+class CompactionResult(BaseModel):
+    """上下文压缩结果。"""
+
+    messages: list[Message]
+    report: CompactionReport | None = None
+    changed: bool = False
+
+
+class StrictContextBuildResult(BaseModel):
+    """严格上下文构建结果。"""
+
+    messages: list[Message]
+    report: ContextUsageReport
