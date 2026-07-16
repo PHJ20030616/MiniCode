@@ -131,7 +131,7 @@ MiniCode/
 - **Default provider is DeepSeek** — `deepseek-v4-flash` model. OpenAI is also pre-configured as an alternative.
 - **Search uses ripgrep** with a Python fallback (`pathlib.Path.rglob` + `re`) when `rg` is unavailable.
 - **No database** — sessions are JSON files, memory is Markdown files, config is YAML. Git-friendly and transparent.
-- **Tool execution is serial** — parallel execution is a future optimization.
+- **Tool execution uses batched concurrency** — read tools (read_file, grep, glob, list_directory) execute concurrently in batches (up to 3 concurrent), write tools execute serially, and consecutive run_subagent calls execute in batch concurrency. This strategy balances performance with safety.
 - **Anthropic support is Phase 10** — current phases focus on OpenAI-compatible providers only.
 - **Streaming output is NOT used for text rendering** — streamed deltas are collected with a "正在思考..." status spinner, then rendered as a single Markdown block. This avoids terminal duplicate-output issues. True streaming will be revisited after core functionality stabilizes.
 
@@ -146,14 +146,14 @@ User input → ChatApp (prompt_toolkit)
               → Collect stream chunks (show "正在思考..." spinner)
               → Assemble text + tool_calls from deltas
               → Render text as Markdown
-              → Execute tools serially → append tool results
+              → Execute tools (batched concurrency for reads, serial for writes) → append tool results
               → Loop until text-only response or max_rounds (20)
 ```
 
 ## Risk Levels
 
 - 🟢 `safe` (read_file, grep, glob) — execute silently
-- 🟡 `caution` (write_file, edit_file) — ask first time per session, remember "always allow"
+- 🟡 `caution` (write_file, edit_file, remember, forget) — ask first time per session, remember "always allow"
 - 🔴 `dangerous` (bash) — ask every time
 
 ## Code Conventions

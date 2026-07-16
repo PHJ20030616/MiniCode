@@ -3,9 +3,14 @@
 实现 ReAct（Reasoning + Acting）模式：
 1. 调用模型（携带工具 schema）
 2. 流式渲染文本回复
-3. 收集 tool_call，串行执行工具
+3. 收集 tool_call，分块并发/串行执行工具
 4. 将工具结果追加回对话
 5. 循环直到模型返回纯文本回复或达到最大轮次
+
+工具执行优化策略：
+- 读工具（read_file, grep, glob 等）：相邻的分到同一块，块内并发执行（上限3）
+- 写工具（write_file, bash 等）：独占一块，串行执行
+- 块间串行执行，保持工具调用的整体顺序
 """
 
 from __future__ import annotations
@@ -14,6 +19,8 @@ import asyncio
 import inspect
 import json
 from collections import defaultdict
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -51,6 +58,24 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+class ToolCategory(Enum):
+    """工具类别。"""
+
+    READ = "read"  # 只读工具，可并发执行
+    WRITE = "write"  # 写工具，必须串行执行
+
+
+@dataclass
+class ToolBlock:
+    """工具执行块。
+
+    将工具调用按读/写分块，块内根据类别决定并发或串行执行。
+    """
+
+    category: ToolCategory
+    tool_calls: list[ToolCall]
+
+
 class AgentLoop:
     """ReAct Agent Loop。
 
@@ -58,13 +83,23 @@ class AgentLoop:
     - 构建 messages（system + history + 最新工具结果）
     - 调用 provider.chat() 并流式渲染
     - 收集并组装 tool_call delta
-    - 串行执行工具，将结果追加回上下文
+    - 分块并发/串行执行工具，将结果追加回上下文
     - 循环直到模型返回纯文本或达到最大轮次
 
     用法：
         loop = AgentLoop(provider, registry, renderer, config)
         await loop.run("请读取 README.md 并总结")
     """
+
+    # 只读工具集合（可并发执行）
+    READ_TOOLS: set[str] = {
+        "read_file",
+        "grep",
+        "glob",
+        "list_directory",
+    }
+    # 其余工具视为写工具，必须串行执行
+    # 包括: write_file, edit_file, bash, remember, forget, run_subagent
 
     def __init__(
         self,
@@ -381,28 +416,290 @@ class AgentLoop:
 
         return tool_calls
 
-    async def _execute_tools(self, tool_calls: list[ToolCall]) -> None:
-        """执行工具调用，并将结果追加到对话历史。
+    def _partition_tool_calls(self, tool_calls: list[ToolCall]) -> list[ToolBlock]:
+        """将工具调用列表按读/写分块。
 
-        普通工具保持串行执行，避免改变权限确认和写操作的既有语义；同一轮中连续的
-        run_subagent 调用会并行执行，并在全部完成后按原 tool_call 顺序写回。
+        规则：
+        1. 相邻的读工具分到同一块
+        2. 每个普通写工具独占一块
+        3. 连续的 run_subagent 合并到同一块（保持现有批量并发逻辑）
+        4. 保持原始调用顺序
+
+        Args:
+            tool_calls: 原始工具调用列表
+
+        Returns:
+            分块后的 ToolBlock 列表
         """
-        index = 0
-        while index < len(tool_calls):
-            tc = tool_calls[index]
-            if tc.function.name == "run_subagent":
-                batch: list[ToolCall] = []
-                while (
-                    index < len(tool_calls)
-                    and tool_calls[index].function.name == "run_subagent"
-                ):
-                    batch.append(tool_calls[index])
-                    index += 1
-                await self._execute_subagent_batch(batch)
-                continue
+        if not tool_calls:
+            return []
 
-            await self._execute_single_tool(tc)
-            index += 1
+        blocks: list[ToolBlock] = []
+        current_read_batch: list[ToolCall] = []
+        current_subagent_batch: list[ToolCall] = []
+
+        for tc in tool_calls:
+            tool_name = tc.function.name
+
+            if tool_name in self.READ_TOOLS:
+                # 读工具：先提交 subagent 批次，然后加入读批次
+                if current_subagent_batch:
+                    blocks.append(
+                        ToolBlock(category=ToolCategory.WRITE, tool_calls=current_subagent_batch)
+                    )
+                    current_subagent_batch = []
+                current_read_batch.append(tc)
+
+            elif tool_name == "run_subagent":
+                # run_subagent：先提交读批次，然后加入 subagent 批次
+                if current_read_batch:
+                    blocks.append(
+                        ToolBlock(category=ToolCategory.READ, tool_calls=current_read_batch)
+                    )
+                    current_read_batch = []
+                current_subagent_batch.append(tc)
+
+            else:
+                # 普通写工具：先提交读批次和 subagent 批次，然后独占一块
+                if current_read_batch:
+                    blocks.append(
+                        ToolBlock(category=ToolCategory.READ, tool_calls=current_read_batch)
+                    )
+                    current_read_batch = []
+                if current_subagent_batch:
+                    blocks.append(
+                        ToolBlock(category=ToolCategory.WRITE, tool_calls=current_subagent_batch)
+                    )
+                    current_subagent_batch = []
+
+                blocks.append(ToolBlock(category=ToolCategory.WRITE, tool_calls=[tc]))
+
+        # 处理末尾的批次
+        if current_read_batch:
+            blocks.append(
+                ToolBlock(category=ToolCategory.READ, tool_calls=current_read_batch)
+            )
+        if current_subagent_batch:
+            blocks.append(
+                ToolBlock(category=ToolCategory.WRITE, tool_calls=current_subagent_batch)
+            )
+
+        return blocks
+
+    async def _execute_tools(self, tool_calls: list[ToolCall]) -> None:
+        """按分块策略执行工具调用。
+
+        - 读工具块：并发执行（上限3）
+        - 写工具块（普通写工具）：串行执行
+        - 写工具块（run_subagent 批次）：批量并发执行
+        - 块间：串行执行
+        """
+        blocks = self._partition_tool_calls(tool_calls)
+
+        for block_idx, block in enumerate(blocks):
+            logger.debug(
+                "执行工具块",
+                block_index=block_idx + 1,
+                total_blocks=len(blocks),
+                category=block.category.value,
+                count=len(block.tool_calls),
+            )
+
+            if block.category == ToolCategory.READ:
+                # 读工具块：并发执行
+                await self._execute_read_block(block.tool_calls)
+            else:
+                # 写工具块：检查是否全是 run_subagent
+                if all(tc.function.name == "run_subagent" for tc in block.tool_calls):
+                    # 批量并发执行 run_subagent
+                    await self._execute_subagent_batch(block.tool_calls)
+                else:
+                    # 普通写工具：逐个串行执行
+                    for tc in block.tool_calls:
+                        await self._execute_single_tool(tc)
+
+    async def _execute_read_block(self, tool_calls: list[ToolCall]) -> None:
+        """并发执行一组读工具调用。
+
+        - 并发上限为 3
+        - 按原始顺序追加 ToolMessage 到 self.messages
+        - 即使某个工具失败，其他工具仍继续执行
+        - 处理权限检查（虽然读工具通常是 safe）
+
+        Args:
+            tool_calls: 读工具调用列表
+        """
+        if not tool_calls:
+            return
+
+        # 并发上限为 3
+        semaphore = asyncio.Semaphore(3)
+
+        async def _execute_one(index: int, tc: ToolCall) -> tuple[int, ToolMessage]:
+            """执行单个读工具，返回 (原始索引, ToolMessage)。"""
+            async with semaphore:
+                name = tc.function.name
+
+                # 解析参数
+                try:
+                    args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                except json.JSONDecodeError as e:
+                    logger.debug("工具参数解析失败", tool=name, error=str(e))
+                    return (
+                        index,
+                        ToolMessage(
+                            content=f"参数解析错误：{e}",
+                            tool_call_id=tc.id,
+                            name=name,
+                        ),
+                    )
+
+                # 权限检查
+                decision = check_permission(
+                    tool_name=name,
+                    arguments=args,
+                    workspace_root=self.workspace_root,
+                    trust_mode=self.config.permissions.trust_mode,
+                )
+
+                # denied：拒绝执行
+                if decision.denied:
+                    logger.debug("工具权限拒绝", tool=name, reason=decision.summary)
+                    return (
+                        index,
+                        ToolMessage(
+                            content=f"权限拒绝：{decision.summary}",
+                            tool_call_id=tc.id,
+                            name=name,
+                        ),
+                    )
+
+                # requires_confirmation：需要用户确认
+                if decision.requires_confirmation:
+                    # trust_mode 跳过确认
+                    if self.config.permissions.trust_mode:
+                        pass  # 允许执行
+                    else:
+                        # 检查 always-allow 存储
+                        store_matched = False
+                        if self.permission_store is not None and decision.target_paths:
+                            store_matched = self.permission_store.find_match(
+                                name, decision.target_paths
+                            )
+
+                        if not store_matched:
+                            # 需要 confirmer
+                            if self.permission_confirmer is None:
+                                # 无 confirmer → 拒绝执行
+                                logger.debug("工具权限需要确认但无 confirmer", tool=name)
+                                return (
+                                    index,
+                                    ToolMessage(
+                                        content=f"权限拒绝：{decision.summary}",
+                                        tool_call_id=tc.id,
+                                        name=name,
+                                    ),
+                                )
+                            else:
+                                # 有 confirmer → 询问用户（注意：这会在并发中阻塞）
+                                result = await self.permission_confirmer.confirm(decision)
+
+                                if result.action == "deny":
+                                    logger.debug("用户拒绝工具执行", tool=name)
+                                    return (
+                                        index,
+                                        ToolMessage(
+                                            content=f"用户拒绝：{decision.summary}",
+                                            tool_call_id=tc.id,
+                                            name=name,
+                                        ),
+                                    )
+
+                                if result.action == "always_allow":
+                                    # 添加到 store
+                                    if self.permission_store is not None and decision.target_paths:
+                                        try:
+                                            rel = decision.target_paths[0].relative_to(
+                                                self.workspace_root
+                                            )
+                                            pattern = rel.as_posix()
+                                            self.permission_store.add_rule(name, pattern)
+                                        except ValueError:
+                                            pass
+                                # allow 或 always_allow 都继续执行
+
+                # 执行工具
+                logger.debug("并发执行读工具", tool=name, args=args)
+                try:
+                    result = await self.tool_registry.execute_tool(
+                        name=name,
+                        args=args,
+                        workspace_root=self.workspace_root,
+                    )
+                except Exception as e:
+                    logger.debug("工具执行异常", tool=name, error=str(e), exc_info=True)
+                    return (
+                        index,
+                        ToolMessage(
+                            content=f"工具执行失败：{e}",
+                            tool_call_id=tc.id,
+                            name=name,
+                        ),
+                    )
+
+                # 构造 ToolMessage
+                if not result.success:
+                    error_detail = result.error or result.output
+                    logger.debug("工具执行失败", tool=name, error=error_detail[:100])
+
+                return (
+                    index,
+                    ToolMessage(
+                        content=result.output,
+                        tool_call_id=tc.id,
+                        name=name,
+                    ),
+                )
+
+        # 并发执行所有读工具
+        if len(tool_calls) > 1:
+            self.renderer.console.print(
+                Text(f"\n── 正在并发执行 {len(tool_calls)} 个读工具 ──", style="dim")
+            )
+        else:
+            self.renderer.console.print(
+                Text(f"\n── 正在调用工具：{tool_calls[0].function.name} ──", style="dim")
+            )
+
+        results = await asyncio.gather(
+            *(_execute_one(idx, tc) for idx, tc in enumerate(tool_calls))
+        )
+
+        # 按原始顺序排序并追加到 messages
+        results_sorted = sorted(results, key=lambda x: x[0])
+        for _, tool_msg in results_sorted:
+            self.messages.append(tool_msg)
+
+        # 显示执行完成信息
+        success_count = sum(
+            1
+            for _, msg in results_sorted
+            if not msg.content.startswith("参数解析错误")
+            and not msg.content.startswith("权限拒绝")
+            and not msg.content.startswith("工具执行失败")
+        )
+        if len(tool_calls) > 1:
+            self.renderer.show_info(f"读工具执行完成：{success_count}/{len(tool_calls)} 成功")
+        else:
+            if success_count == 1:
+                self.renderer.show_info(
+                    f"工具执行成功（{len(results_sorted[0][1].content)} 字符）"
+                )
+            else:
+                self.renderer.show_error(
+                    f"工具执行失败：{tool_calls[0].function.name} — "
+                    f"{results_sorted[0][1].content[:200]}"
+                )
 
     async def _execute_subagent_batch(self, tool_calls: list[ToolCall]) -> None:
         """并行执行一组连续的 run_subagent 调用，按原始顺序追加 ToolMessage。"""

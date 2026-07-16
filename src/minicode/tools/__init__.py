@@ -7,6 +7,7 @@ from minicode.tools.base import BaseTool, ToolResult
 from minicode.tools.file_edit import EditFile
 from minicode.tools.file_read import ReadFile
 from minicode.tools.file_write import WriteFile
+from minicode.tools.forget import Forget
 from minicode.tools.glob import GlobFiles
 from minicode.tools.grep import GrepFiles
 from minicode.tools.registry import ToolRegistry
@@ -24,6 +25,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
     registry.register(EditFile)
     registry.register(ShellTool)
     registry.register(Remember)
+    registry.register(Forget)
 
 
 def create_default_registry() -> ToolRegistry:
@@ -36,6 +38,7 @@ def create_default_registry() -> ToolRegistry:
 __all__ = [
     "BaseTool",
     "EditFile",
+    "Forget",
     "GlobFiles",
     "GrepFiles",
     "ReadFile",
