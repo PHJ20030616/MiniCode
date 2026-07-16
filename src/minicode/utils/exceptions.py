@@ -17,6 +17,10 @@ class ContextWindowExceededError(MiniCodeError):
     """严格上下文超过模型输入窗口时抛出的异常。"""
 
 
+class ContextCompactionError(MiniCodeError):
+    """上下文压缩无法生成可提交结果。"""
+
+
 class ConfigError(MiniCodeError):
     """配置相关的错误。
 
