@@ -3,7 +3,7 @@
 > **版本：** 0.1
 >
 > **日期：** 2026-07-16
-> **状态：** 已完成方案评审，等待实施计划
+> **状态：** 已完成方案评审，实施计划已确认
 
 ---
 
@@ -455,9 +455,9 @@ consumed_by_main_model = false
 
 ```text
 read_file
-grep_files
-glob_files
-run_shell
+grep
+glob
+shell
 ```
 
 名单可配置，按工具名称精确匹配并去重。
@@ -617,9 +617,9 @@ agent:
       summary_max_tokens: 2048
       cleanup_tools:
         - read_file
-        - grep_files
-        - glob_files
-        - run_shell
+        - grep
+        - glob
+        - shell
 ```
 
 配置校验：
