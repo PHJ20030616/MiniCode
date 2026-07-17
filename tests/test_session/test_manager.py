@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from minicode.providers.base import ContentBlock, FunctionCall, Message, ToolCall, ToolMessage
+from minicode.session import manager as session_manager_module
 from minicode.session.manager import SessionManager
 
 # 一个格式合法的、不存在的 session_id（32 位小写十六进制）
@@ -443,14 +444,14 @@ class TestSummary:
         assert manager._compute_summary(session) == "你好世界"
 
     def test_summary_long_user_message(self, tmp_path: Path) -> None:
-        """超过 15 字符时截断为前 15 字符 + ...."""
+        """超过 15 字符时截断为前 15 字符 + ...。"""
         manager = SessionManager(tmp_path)
         session = manager.create()
         session.messages.append(
             Message(role="user", content="这是一个非常长的用户消息，需要被截断显示")
         )
         assert manager._compute_summary(session) == (
-            "这是一个非常长的用户消息，需要被截断显示"[:15] + "...."
+            "这是一个非常长的用户消息，需要被截断显示"[:15] + "..."
         )
 
     def test_summary_no_user_message(self, tmp_path: Path) -> None:
@@ -512,14 +513,14 @@ class TestSummary:
         assert index[0]["summary"] == text
 
     def test_save_summary_over_15_chars(self, tmp_path: Path) -> None:
-        """超过 15 字符时截断并追加 ....。"""
+        """超过 15 字符时截断并追加 ...。"""
         manager = SessionManager(tmp_path)
         session = manager.create()
         session.messages.append(Message(role="user", content="这是一个超过十五个字符的测试消息"))
         manager.save(session)
 
         index = manager._load_index()
-        assert index[0]["summary"] == "这是一个超过十五个字符的测试消息"[:15] + "...."
+        assert index[0]["summary"] == "这是一个超过十五个字符的测试消息"[:15] + "..."
 
     def test_save_no_user_message_summary(self, tmp_path: Path) -> None:
         """没有 user 消息时 summary 为 （无概要）。"""
@@ -529,3 +530,63 @@ class TestSummary:
 
         index = manager._load_index()
         assert index[0]["summary"] == "（无概要）"
+
+    def test_summary_prefers_initial_user_summary(self, tmp_path: Path) -> None:
+        """稳定的初始任务概要应优先于被压缩后的消息历史。"""
+        manager = SessionManager(tmp_path)
+        session = manager.create()
+        session.metadata["initial_user_summary"] = "  最初的真实任务  "
+        session.messages.append(
+            Message(role="user", content="压缩后的摘要", kind="compact_summary")
+        )
+
+        assert manager._compute_summary(session) == "最初的真实任务"
+
+    def test_summary_skips_compact_summary_for_legacy_session(self, tmp_path: Path) -> None:
+        """旧会话没有元数据时应跳过 compact_summary，寻找真实用户消息。"""
+        manager = SessionManager(tmp_path)
+        session = manager.create()
+        session.messages.extend(
+            [
+                Message(role="user", content="压缩摘要", kind="compact_summary"),
+                Message(role="assistant", content="中间回答"),
+                Message(role="user", content="真实用户任务"),
+            ]
+        )
+
+        assert manager._compute_summary(session) == "真实用户任务"
+
+    def test_summary_ignores_invalid_initial_user_summary(self, tmp_path: Path) -> None:
+        """空白或非字符串元数据不应遮蔽真实用户消息。"""
+        manager = SessionManager(tmp_path)
+        session = manager.create()
+        session.metadata["initial_user_summary"] = "   "
+        session.messages.append(Message(role="user", content="真实用户任务"))
+
+        assert manager._compute_summary(session) == "真实用户任务"
+
+        session.metadata["initial_user_summary"] = 123
+        assert manager._compute_summary(session) == "真实用户任务"
+
+    def test_content_block_and_string_summary_share_truncation_rule(self) -> None:
+        """字符串与内容块必须复用相同的去空白和 15 字截断规则。"""
+        text = "  一二三四五六七八九十一二三四五六  "
+        blocks = [
+            ContentBlock(type="text", text="  一二三四五六七八"),
+            ContentBlock(type="text", text="九十一二三四五六  "),
+        ]
+
+        assert (
+            session_manager_module.summarize_user_input(text)
+            == "一二三四五六七八九十一二三四五..."
+        )
+        assert (
+            session_manager_module.summarize_user_input(blocks)
+            == "一二三四五六七八九十一二三四五..."
+        )
+        assert (
+            session_manager_module.summarize_user_input(
+                [ContentBlock(type="text", text="   ")]
+            )
+            == "（无概要）"
+        )

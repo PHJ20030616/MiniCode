@@ -17,6 +17,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
 
 from minicode.agent import AgentLoop
+from minicode.agent.context_models import CompactionReport
 from minicode.cli.completer import CommandCompleter
 from minicode.cli.renderer import StreamingRenderer
 from minicode.cli.theme import MINICODE_THEME
@@ -25,6 +26,7 @@ from minicode.commands.registry import CommandRegistry
 from minicode.config.models import AppConfig, ProviderConfig
 from minicode.providers.registry import ProviderRegistry
 from minicode.session import Session, SessionManager
+from minicode.session.manager import summarize_user_input
 from minicode.tools import create_default_registry
 from minicode.tools.subagent import RunSubagentTool
 from minicode.utils.exceptions import ProviderError
@@ -50,6 +52,7 @@ class ChatApp:
         self._agent_loop: AgentLoop | None = None
         self._session_manager: SessionManager | None = None
         self._current_session: Session | None = None
+        self._initial_user_summary: str | None = None
         self._interrupted: bool = False
 
     @property
@@ -112,8 +115,10 @@ class ChatApp:
         logger.debug("正在优雅关闭...")
         try:
             if self._agent_loop is not None and self._current_session is not None:
-                self._current_session.messages = list(self._agent_loop.messages)
-                self._current_session.updated_at = datetime.now(UTC)
+                self._sync_session_from_agent(
+                    self._current_session,
+                    self._agent_loop,
+                )
                 self._get_session_manager().save(self._current_session)
                 logger.debug("会话已保存", session_id=self._current_session.id)
         except Exception as e:
@@ -204,6 +209,54 @@ class ChatApp:
             self._session_manager = SessionManager(self.workspace_root)
         return self._session_manager
 
+    def _sync_session_from_agent(
+        self,
+        session: Session,
+        agent_loop: AgentLoop,
+    ) -> None:
+        """把 AgentLoop 当前状态同步为独立的 Session 快照。"""
+        session.messages = [
+            message.model_copy(deep=True)
+            for message in agent_loop.messages
+        ]
+        session.updated_at = datetime.now(UTC)
+        session.metadata["compaction_count"] = agent_loop.compaction_count
+        if agent_loop.last_compaction_report is None:
+            session.metadata.pop("last_compaction", None)
+        else:
+            session.metadata["last_compaction"] = (
+                agent_loop.last_compaction_report.model_dump(mode="json")
+            )
+        if self._initial_user_summary:
+            session.metadata["initial_user_summary"] = self._initial_user_summary
+
+    def _restore_session_to_agent(
+        self,
+        session: Session,
+        agent_loop: AgentLoop,
+    ) -> None:
+        """从 Session 恢复 AgentLoop 状态，并保持消息对象相互独立。"""
+        agent_loop.messages.clear()
+        agent_loop.messages.extend(
+            message.model_copy(deep=True)
+            for message in session.messages
+        )
+        agent_loop.compaction_count = int(
+            session.metadata.get("compaction_count", 0)
+        )
+        report_data = session.metadata.get("last_compaction")
+        agent_loop.last_compaction_report = (
+            CompactionReport.model_validate(report_data)
+            if isinstance(report_data, dict)
+            else None
+        )
+        initial_summary = session.metadata.get("initial_user_summary")
+        self._initial_user_summary = (
+            initial_summary.strip()
+            if isinstance(initial_summary, str) and initial_summary.strip()
+            else None
+        )
+
     async def _auto_save(self, agent_loop: AgentLoop) -> None:
         """Agent Loop 每轮完成后自动保存会话到磁盘。
 
@@ -220,9 +273,7 @@ class ChatApp:
                     provider=self.config.default_provider,
                     workspace_root=str(self.workspace_root),
                 )
-            # 同步消息历史到会话（浅拷贝快照）
-            self._current_session.messages = list(agent_loop.messages)
-            self._current_session.updated_at = datetime.now(UTC)
+            self._sync_session_from_agent(self._current_session, agent_loop)
             manager.save(self._current_session)
         except Exception as e:
             logger.debug("自动保存会话失败", error=str(e))
@@ -249,11 +300,15 @@ class ChatApp:
 
         # 记录当前历史长度，用于异常回滚
         history_len = len(agent_loop.messages)
+        if self._initial_user_summary is None:
+            self._initial_user_summary = summarize_user_input(text)
 
         try:
             result = await agent_loop.run(text)
             if result is not None:
                 await self._auto_save(agent_loop)
+            elif self._current_session is None:
+                self._initial_user_summary = None
         except ProviderError as e:
             # 回滚本次用户消息
             del agent_loop.messages[history_len:]
@@ -273,6 +328,9 @@ class ChatApp:
         # 清空现有消息历史，AgentLoop 会在下一轮自动注入 system prompt
         if agent_loop is not None:
             agent_loop.messages.clear()
+            agent_loop.compaction_count = 0
+            agent_loop.last_compaction_report = None
+        self._initial_user_summary = None
 
         # 创建新会话
         manager = self._get_session_manager()
@@ -302,7 +360,10 @@ class ChatApp:
 
         # 保存当前会话
         if self._current_session is not None and self._agent_loop is not None:
-            self._current_session.messages = list(self._agent_loop.messages)
+            self._sync_session_from_agent(
+                self._current_session,
+                self._agent_loop,
+            )
             manager.save(self._current_session)
 
         # 加载目标会话
@@ -312,8 +373,7 @@ class ChatApp:
 
         # 替换 AgentLoop 消息
         agent_loop = self._get_agent_loop()
-        agent_loop.messages.clear()
-        agent_loop.messages.extend(target.messages)
+        self._restore_session_to_agent(target, agent_loop)
 
         # 更新当前会话引用
         self._current_session = target
@@ -428,10 +488,16 @@ class ChatApp:
     async def _on_session_created(self, session: Any) -> None:
         """/clear 创建新会话后的回调，更新 _current_session。"""
         self._current_session = session
+        if self._agent_loop is not None:
+            self._agent_loop.compaction_count = 0
+            self._agent_loop.last_compaction_report = None
+        self._initial_user_summary = None
 
     async def _on_session_switched(self, session: Any) -> None:
         """/session switch 切换会话后的回调，更新 _current_session。"""
         self._current_session = session
+        if self._agent_loop is not None:
+            self._restore_session_to_agent(session, self._agent_loop)
 
     async def _on_session_deleted(self, session_id: str) -> None:
         """/session delete 删除会话后的回调。若删除的是当前活跃会话，自动创建新会话。"""

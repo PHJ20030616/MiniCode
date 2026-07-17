@@ -64,6 +64,18 @@ def serialize_messages(messages: list[Message]) -> list[dict]:
     return [msg.model_dump(mode="json") for msg in messages]
 
 
+def _has_later_committed_assistant(data: list[dict], start: int) -> bool:
+    """检查指定位置之后是否存在已提交的 assistant 消息。"""
+    for item in data[start:]:
+        if item.get("role") != "assistant":
+            continue
+        content = item.get("content")
+        has_text = isinstance(content, str) and bool(content.strip())
+        if has_text or bool(item.get("tool_calls")):
+            return True
+    return False
+
+
 def deserialize_messages(data: list[dict]) -> list[Message]:
     """将 JSON 字典列表反序列化为 Message 列表。
 
@@ -78,10 +90,17 @@ def deserialize_messages(data: list[dict]) -> list[Message]:
         Message / ToolMessage 实例列表。
     """
     result: list[Message] = []
-    for item in data:
-        role = item.get("role")
+    for index, item in enumerate(data):
+        # 迁移字段写入逐项副本，避免修改调用方持有的原始 JSON 数据。
+        item_data = dict(item)
+        role = item_data.get("role")
         if role == "tool":
-            result.append(ToolMessage(**item))
+            if "consumed_by_main_model" not in item_data:
+                item_data["consumed_by_main_model"] = _has_later_committed_assistant(
+                    data,
+                    index + 1,
+                )
+            result.append(ToolMessage(**item_data))
         else:
-            result.append(Message(**item))
+            result.append(Message(**item_data))
     return result

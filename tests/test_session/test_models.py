@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 
 from minicode.providers.base import FunctionCall, Message, ToolCall, ToolMessage
 from minicode.session.models import (
@@ -164,6 +165,106 @@ class TestDeserializeMessages:
         assert len(messages[0].tool_calls) == 1
         assert messages[0].tool_calls[0].function.name == "read_file"
 
+    def test_legacy_tool_result_with_later_assistant_is_inferred_consumed(self) -> None:
+        """旧工具结果后有已提交 assistant 消息时应迁移为已消费。"""
+        data = [
+            {"role": "tool", "content": "42", "tool_call_id": "call_1"},
+            {"role": "assistant", "content": "最终回答"},
+        ]
+
+        messages = deserialize_messages(data)
+
+        assert isinstance(messages[0], ToolMessage)
+        assert messages[0].consumed_by_main_model is True
+
+    def test_legacy_trailing_tool_result_is_inferred_unconsumed(self) -> None:
+        """末尾旧工具结果没有后续 assistant 提交时应保持未消费。"""
+        data = [{"role": "tool", "content": "42", "tool_call_id": "call_1"}]
+
+        messages = deserialize_messages(data)
+
+        assert isinstance(messages[0], ToolMessage)
+        assert messages[0].consumed_by_main_model is False
+
+    def test_explicit_unconsumed_state_is_not_overridden_by_migration(self) -> None:
+        """显式未消费状态优先于旧数据迁移推断。"""
+        data = [
+            {
+                "role": "tool",
+                "content": "42",
+                "tool_call_id": "call_1",
+                "consumed_by_main_model": False,
+            },
+            {"role": "assistant", "content": "最终回答"},
+        ]
+
+        messages = deserialize_messages(data)
+
+        assert isinstance(messages[0], ToolMessage)
+        assert messages[0].consumed_by_main_model is False
+
+    def test_explicit_consumed_state_is_not_overridden_by_migration(self) -> None:
+        """显式已消费状态在没有后续 assistant 时也必须保留。"""
+        data = [
+            {
+                "role": "tool",
+                "content": "42",
+                "tool_call_id": "call_1",
+                "consumed_by_main_model": True,
+            }
+        ]
+
+        messages = deserialize_messages(data)
+
+        assert isinstance(messages[0], ToolMessage)
+        assert messages[0].consumed_by_main_model is True
+
+    def test_later_empty_assistant_is_not_committed(self) -> None:
+        """仅包含空白文本的 assistant 消息不算已提交。"""
+        data = [
+            {"role": "tool", "content": "42", "tool_call_id": "call_1"},
+            {"role": "assistant", "content": "   "},
+        ]
+
+        messages = deserialize_messages(data)
+
+        assert isinstance(messages[0], ToolMessage)
+        assert messages[0].consumed_by_main_model is False
+
+    def test_later_assistant_tool_calls_is_committed(self) -> None:
+        """带 tool_calls 的 assistant 即使没有文本也算已提交。"""
+        data = [
+            {"role": "tool", "content": "42", "tool_call_id": "call_1"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            },
+        ]
+
+        messages = deserialize_messages(data)
+
+        assert isinstance(messages[0], ToolMessage)
+        assert messages[0].consumed_by_main_model is True
+
+    def test_deserialize_does_not_mutate_input_dicts(self) -> None:
+        """迁移旧数据时不得原地写入调用方提供的字典。"""
+        data = [
+            {"role": "tool", "content": "42", "tool_call_id": "call_1"},
+            {"role": "assistant", "content": "最终回答"},
+        ]
+        original = deepcopy(data)
+
+        deserialize_messages(data)
+
+        assert data == original
+
 
 class TestRoundtrip:
     """序列化→反序列化往返测试。"""
@@ -209,3 +310,20 @@ class TestRoundtrip:
         restored = deserialize_messages(serialized)
         re_serialized = serialize_messages(restored)
         json.dumps(re_serialized, ensure_ascii=False)
+
+    def test_message_internal_fields_round_trip(self) -> None:
+        """内部 kind 与工具消费状态必须完整往返。"""
+        original = [
+            Message(role="user", content="历史摘要", kind="compact_summary"),
+            ToolMessage(
+                content="工具结果",
+                tool_call_id="call_1",
+                consumed_by_main_model=True,
+            ),
+        ]
+
+        restored = deserialize_messages(serialize_messages(original))
+
+        assert restored[0].kind == "compact_summary"
+        assert isinstance(restored[1], ToolMessage)
+        assert restored[1].consumed_by_main_model is True

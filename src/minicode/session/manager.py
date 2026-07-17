@@ -11,10 +11,39 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 
+from minicode.providers.base import ContentBlock, Message
 from minicode.session.models import Session, deserialize_messages, serialize_messages
 from minicode.utils.log import get_logger
 
 logger = get_logger(__name__)
+
+
+def _message_text(message: Message) -> str:
+    """提取消息中的纯文本内容并去除首尾空白。"""
+    content = message.content
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    return "".join(
+        block.text
+        for block in content
+        if block.type == "text" and block.text
+    ).strip()
+
+
+def _summarize_text(text: str) -> str:
+    """应用会话列表统一的空概要与 15 字截断规则。"""
+    if not text:
+        return "（无概要）"
+    if len(text) <= 15:
+        return text
+    return text[:15] + "..."
+
+
+def summarize_user_input(content: str | list[ContentBlock] | None) -> str:
+    """将用户输入转换为稳定的会话列表概要。"""
+    return _summarize_text(_message_text(Message(role="user", content=content)))
 
 
 class SessionManager:
@@ -207,25 +236,16 @@ class SessionManager:
             session: 会话实例。
 
         Returns:
-            概要字符串，最多 15 个字符（超过时截断并追加 "...."）。
+            概要字符串，超过 15 个字符时截断并追加 "..."。
         """
-        for msg in session.messages:
-            if msg.role != "user":
+        initial_summary = session.metadata.get("initial_user_summary")
+        if isinstance(initial_summary, str) and initial_summary.strip():
+            return initial_summary.strip()
+
+        for message in session.messages:
+            if message.role != "user" or message.kind == "compact_summary":
                 continue
-            content = msg.content
-            if content is None:
-                text = ""
-            elif isinstance(content, str):
-                text = content.strip()
-            else:
-                # ContentBlock 列表，拼接 text 块
-                parts = [b.text for b in content if b.type == "text" and b.text]
-                text = "".join(parts).strip()
-            if not text:
-                return "（无概要）"
-            if len(text) <= 15:
-                return text
-            return text[:15] + "...."
+            return _summarize_text(_message_text(message))
         return "（无概要）"
 
     @staticmethod

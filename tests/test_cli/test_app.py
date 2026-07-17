@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -9,11 +10,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from minicode.agent import AgentLoop
+from minicode.agent.context_models import CompactionReport, CompactionTrigger
 from minicode.agent.subagents.models import SubagentConfig
 from minicode.cli.app import ChatApp
 from minicode.commands.base import CommandResult
 from minicode.config.models import AgentConfig, AppConfig, PermissionsConfig, ProviderConfig
-from minicode.providers.base import Message
+from minicode.providers.base import ContentBlock, Message, ToolMessage
 from minicode.providers.registry import MockProvider
 from minicode.utils.exceptions import ProviderError
 
@@ -37,6 +39,24 @@ def _make_config(**overrides: Any) -> AppConfig:
     for key, value in overrides.items():
         setattr(config, key, value)
     return config
+
+
+def _compaction_report() -> CompactionReport:
+    """创建稳定的压缩报告。"""
+    return CompactionReport(
+        trigger=CompactionTrigger.MANUAL,
+        created_at=datetime(2026, 7, 17, tzinfo=UTC),
+        before_tokens=100,
+        after_tokens=40,
+        before_message_count=8,
+        after_message_count=3,
+        summarized_message_count=5,
+        cleared_tool_result_count=1,
+        unconsumed_tool_result_count=0,
+        retry_used=False,
+        target_reached=True,
+        focus_provided=False,
+    )
 
 
 @pytest.fixture
@@ -212,6 +232,326 @@ class TestHandleMessage:
             assert not sessions_dir.exists()
             # auto_save 内部的 try/except 也可能吞掉了错误，
             # 但既然没有调用 manager.save，磁盘上就不会有文件
+
+    async def test_failed_first_task_resets_initial_summary(
+        self, chat_app: ChatApp, tmp_path: Path
+    ) -> None:
+        """首个任务返回 None 且尚无 Session 时不应污染下一次任务概要。"""
+        chat_app.workspace_root = tmp_path
+        with patch(
+            "minicode.cli.app.ProviderRegistry.get",
+            return_value=MockProvider("模拟回复"),
+        ):
+            agent_loop = chat_app._get_agent_loop()
+
+            async def none_run(user_input: str) -> str | None:
+                assert chat_app._initial_user_summary == "失败任务"
+                return None
+
+            agent_loop.run = none_run  # type: ignore[method-assign]
+
+            await chat_app._handle_message("  失败任务  ")
+
+        assert chat_app._current_session is None
+        assert chat_app._initial_user_summary is None
+
+    async def test_successful_first_task_persists_initial_summary(
+        self, chat_app: ChatApp, tmp_path: Path
+    ) -> None:
+        """首次任务成功保存后应把稳定概要写入 Session 元数据。"""
+        chat_app.workspace_root = tmp_path
+        with patch(
+            "minicode.cli.app.ProviderRegistry.get",
+            return_value=MockProvider("模拟回复"),
+        ):
+            agent_loop = chat_app._get_agent_loop()
+
+            async def successful_run(user_input: str) -> str | None:
+                assert chat_app._initial_user_summary == "一二三四五六七八九十一二三四五..."
+                agent_loop.messages.extend(
+                    [
+                        Message(role="user", content=user_input),
+                        Message(role="assistant", content="已完成"),
+                    ]
+                )
+                return "已完成"
+
+            agent_loop.run = successful_run  # type: ignore[method-assign]
+
+            await chat_app._handle_message("  一二三四五六七八九十一二三四五六  ")
+
+        assert chat_app._current_session is not None
+        assert (
+            chat_app._current_session.metadata["initial_user_summary"]
+            == "一二三四五六七八九十一二三四五..."
+        )
+        loaded = chat_app._get_session_manager().load(chat_app._current_session.id)
+        assert loaded is not None
+        assert (
+            loaded.metadata["initial_user_summary"]
+            == "一二三四五六七八九十一二三四五..."
+        )
+
+
+@pytest.mark.asyncio
+class TestSessionStatePersistence:
+    """测试 ChatApp 与 Session 之间的压缩状态同步。"""
+
+    async def test_auto_save_persists_compaction_state_and_deep_copies_messages(
+        self, chat_app: ChatApp, tmp_path: Path
+    ) -> None:
+        """自动保存应持久化全部状态，且消息快照不共享可变对象。"""
+        chat_app.workspace_root = tmp_path
+        with patch(
+            "minicode.cli.app.ProviderRegistry.get",
+            return_value=MockProvider("回复"),
+        ):
+            agent_loop = chat_app._get_agent_loop()
+        agent_loop.messages.append(
+            Message(
+                role="user",
+                content=[ContentBlock(type="text", text="原始内容")],
+            )
+        )
+        agent_loop.compaction_count = 2
+        agent_loop.last_compaction_report = _compaction_report()
+        chat_app._initial_user_summary = "初始任务"
+
+        await chat_app._auto_save(agent_loop)
+
+        session = chat_app._current_session
+        assert session is not None
+        assert session.metadata["compaction_count"] == 2
+        assert session.metadata["last_compaction"] == _compaction_report().model_dump(mode="json")
+        assert session.metadata["initial_user_summary"] == "初始任务"
+        assert session.messages[0] is not agent_loop.messages[0]
+
+        loop_content = agent_loop.messages[0].content
+        session_content = session.messages[0].content
+        assert isinstance(loop_content, list)
+        assert isinstance(session_content, list)
+        loop_content[0].text = "循环已修改"
+        assert session_content[0].text == "原始内容"
+        session_content[0].text = "会话已修改"
+        assert loop_content[0].text == "循环已修改"
+
+        loaded = chat_app._get_session_manager().load(session.id)
+        assert loaded is not None
+        assert loaded.metadata == session.metadata
+
+    async def test_auto_save_removes_stale_last_compaction_metadata(
+        self, chat_app: ChatApp, tmp_path: Path
+    ) -> None:
+        """当前没有压缩报告时应移除 Session 中遗留的旧报告。"""
+        chat_app.workspace_root = tmp_path
+        manager = chat_app._get_session_manager()
+        chat_app._current_session = manager.create()
+        chat_app._current_session.metadata["last_compaction"] = _compaction_report().model_dump(
+            mode="json"
+        )
+        with patch(
+            "minicode.cli.app.ProviderRegistry.get",
+            return_value=MockProvider("回复"),
+        ):
+            agent_loop = chat_app._get_agent_loop()
+        agent_loop.last_compaction_report = None
+
+        await chat_app._auto_save(agent_loop)
+
+        assert "last_compaction" not in chat_app._current_session.metadata
+
+    async def test_shutdown_saves_with_shared_session_sync_semantics(
+        self, chat_app: ChatApp, tmp_path: Path
+    ) -> None:
+        """优雅退出保存分支应同步压缩状态、概要与深拷贝消息。"""
+        chat_app.workspace_root = tmp_path
+        manager = chat_app._get_session_manager()
+        chat_app._current_session = manager.create()
+        with patch(
+            "minicode.cli.app.ProviderRegistry.get",
+            return_value=MockProvider("回复"),
+        ):
+            agent_loop = chat_app._get_agent_loop()
+        agent_loop.messages.append(Message(role="user", content="退出前任务"))
+        agent_loop.compaction_count = 4
+        agent_loop.last_compaction_report = _compaction_report()
+        chat_app._initial_user_summary = "退出前任务"
+
+        await chat_app._shutdown_gracefully()
+
+        saved = manager.load(chat_app._current_session.id)
+        assert saved is not None
+        assert saved.metadata["compaction_count"] == 4
+        assert saved.metadata["last_compaction"] == _compaction_report().model_dump(mode="json")
+        assert saved.metadata["initial_user_summary"] == "退出前任务"
+        assert chat_app._current_session.messages[0] is not agent_loop.messages[0]
+
+    async def test_switch_saves_source_and_restores_target_state(
+        self, chat_app: ChatApp, tmp_path: Path
+    ) -> None:
+        """切换会话应按统一语义保存源会话并恢复目标压缩状态。"""
+        chat_app.workspace_root = tmp_path
+        manager = chat_app._get_session_manager()
+        source = manager.create()
+        target = manager.create()
+        target.messages.append(
+            Message(
+                role="user",
+                content=[ContentBlock(type="text", text="目标任务")],
+            )
+        )
+        target.metadata.update(
+            {
+                "compaction_count": "3",
+                "last_compaction": _compaction_report().model_dump(mode="json"),
+                "initial_user_summary": "  目标任务  ",
+            }
+        )
+        manager.save(target)
+        chat_app._current_session = source
+        with patch(
+            "minicode.cli.app.ProviderRegistry.get",
+            return_value=MockProvider("回复"),
+        ):
+            agent_loop = chat_app._get_agent_loop()
+        agent_loop.messages.append(
+            ToolMessage(
+                content="源工具结果",
+                tool_call_id="call_1",
+                consumed_by_main_model=True,
+            )
+        )
+        agent_loop.compaction_count = 5
+        agent_loop.last_compaction_report = _compaction_report()
+        chat_app._initial_user_summary = "源任务"
+
+        switched = await chat_app.switch_session(target.id)
+
+        assert switched is True
+        saved_source = manager.load(source.id)
+        assert saved_source is not None
+        assert saved_source.metadata["compaction_count"] == 5
+        assert saved_source.metadata["last_compaction"] == _compaction_report().model_dump(
+            mode="json"
+        )
+        assert saved_source.metadata["initial_user_summary"] == "源任务"
+        assert isinstance(saved_source.messages[0], ToolMessage)
+        assert saved_source.messages[0].consumed_by_main_model is True
+
+        assert agent_loop.compaction_count == 3
+        assert agent_loop.last_compaction_report == _compaction_report()
+        assert chat_app._initial_user_summary == "目标任务"
+        assert chat_app._current_session is not None
+        assert agent_loop.messages[0] is not chat_app._current_session.messages[0]
+        loop_content = agent_loop.messages[0].content
+        session_content = chat_app._current_session.messages[0].content
+        assert isinstance(loop_content, list)
+        assert isinstance(session_content, list)
+        loop_content[0].text = "已修改"
+        assert session_content[0].text == "目标任务"
+
+    async def test_switch_restores_none_for_invalid_last_compaction(
+        self, chat_app: ChatApp, tmp_path: Path
+    ) -> None:
+        """目标元数据中的非字典报告应保守恢复为 None。"""
+        chat_app.workspace_root = tmp_path
+        manager = chat_app._get_session_manager()
+        target = manager.create()
+        target.metadata["last_compaction"] = "旧格式"
+        manager.save(target)
+        with patch(
+            "minicode.cli.app.ProviderRegistry.get",
+            return_value=MockProvider("回复"),
+        ):
+            agent_loop = chat_app._get_agent_loop()
+        agent_loop.last_compaction_report = _compaction_report()
+        chat_app._initial_user_summary = "旧任务"
+
+        switched = await chat_app.switch_session(target.id)
+
+        assert switched is True
+        assert agent_loop.last_compaction_report is None
+        assert agent_loop.compaction_count == 0
+        assert chat_app._initial_user_summary is None
+
+    async def test_clear_resets_compaction_state_and_initial_summary(
+        self, chat_app: ChatApp, tmp_path: Path
+    ) -> None:
+        """/clear 创建新 Session 时应同时重置压缩状态与稳定概要。"""
+        chat_app.workspace_root = tmp_path
+        with patch(
+            "minicode.cli.app.ProviderRegistry.get",
+            return_value=MockProvider("回复"),
+        ):
+            agent_loop = chat_app._get_agent_loop()
+        agent_loop.messages.append(Message(role="user", content="旧任务"))
+        agent_loop.compaction_count = 6
+        agent_loop.last_compaction_report = _compaction_report()
+        chat_app._initial_user_summary = "旧任务"
+
+        await chat_app._clear_and_new_session()
+
+        assert agent_loop.messages == []
+        assert agent_loop.compaction_count == 0
+        assert agent_loop.last_compaction_report is None
+        assert chat_app._initial_user_summary is None
+
+    async def test_clear_callback_resets_compaction_state_and_initial_summary(
+        self, chat_app: ChatApp, tmp_path: Path
+    ) -> None:
+        """实际 /clear 生命周期回调也应重置瞬态会话状态。"""
+        chat_app.workspace_root = tmp_path
+        with patch(
+            "minicode.cli.app.ProviderRegistry.get",
+            return_value=MockProvider("回复"),
+        ):
+            agent_loop = chat_app._get_agent_loop()
+        agent_loop.compaction_count = 7
+        agent_loop.last_compaction_report = _compaction_report()
+        chat_app._initial_user_summary = "旧任务"
+        new_session = chat_app._get_session_manager().create()
+
+        await chat_app._on_session_created(new_session)
+
+        assert chat_app._current_session is new_session
+        assert agent_loop.compaction_count == 0
+        assert agent_loop.last_compaction_report is None
+        assert chat_app._initial_user_summary is None
+
+    async def test_switch_callback_restores_target_state_with_deep_copy(
+        self, chat_app: ChatApp, tmp_path: Path
+    ) -> None:
+        """实际 /session switch 回调应恢复元数据并重建独立消息快照。"""
+        chat_app.workspace_root = tmp_path
+        with patch(
+            "minicode.cli.app.ProviderRegistry.get",
+            return_value=MockProvider("回复"),
+        ):
+            agent_loop = chat_app._get_agent_loop()
+        target = chat_app._get_session_manager().create()
+        target.messages.append(
+            Message(
+                role="user",
+                content=[ContentBlock(type="text", text="目标任务")],
+            )
+        )
+        target.metadata.update(
+            {
+                "compaction_count": 8,
+                "last_compaction": _compaction_report().model_dump(mode="json"),
+                "initial_user_summary": "目标任务",
+            }
+        )
+        # 模拟 SessionCommand 在通知回调前执行的浅拷贝。
+        agent_loop.messages.extend(target.messages)
+
+        await chat_app._on_session_switched(target)
+
+        assert chat_app._current_session is target
+        assert agent_loop.compaction_count == 8
+        assert agent_loop.last_compaction_report == _compaction_report()
+        assert chat_app._initial_user_summary == "目标任务"
+        assert agent_loop.messages[0] is not target.messages[0]
 
 
 @pytest.mark.asyncio
