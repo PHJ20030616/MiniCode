@@ -29,10 +29,11 @@ from minicode.agent.context_models import (
     CompactionReport,
     CompactionResult,
     CompactionTrigger,
+    ContextUsageReport,
 )
-from minicode.agent.loop import AgentLoop
+from minicode.agent.loop import AgentLoop, AgentTaskSnapshot
 from minicode.agent.planner import PLANNING_SYSTEM_PROMPT
-from minicode.agent.planning_models import PlanningConfig
+from minicode.agent.planning_models import ExecutionPlan, PlanningConfig, PlanStep
 from minicode.cli.confirm import ConfirmerResult
 from minicode.config.models import AgentConfig, AppConfig, PermissionsConfig, ProviderConfig
 from minicode.permissions.models import PermissionDecision
@@ -43,6 +44,7 @@ from minicode.providers.base import (
     PartialToolCall,
     StreamChunk,
     ToolCall,
+    ToolMessage,
     UsageInfo,
 )
 from minicode.tools import create_default_registry
@@ -97,6 +99,29 @@ class MockStepProvider(BaseProvider):
 
     async def list_models(self) -> list[str]:
         return ["mock-model"]
+
+
+class RaisingProvider(BaseProvider):
+    """调用主模型时抛出指定异常。"""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    @property
+    def name(self) -> str:
+        return "raising"
+
+    async def chat(
+        self,
+        messages: list[Message],
+        tools: list[dict] | None = None,
+        stream: bool = True,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[StreamChunk]:
+        raise self.error
+
+    async def list_models(self) -> list[str]:
+        return []
 
 
 # ─── Fixtures ──────────────────────────────────────────────────────
@@ -266,6 +291,77 @@ def _auto_compaction_config() -> CompactionConfig:
         target_ratio=0.0005,
         summary_max_tokens=64,
     )
+
+
+def _tool_exchange(*, consumed: bool = False) -> list[Message]:
+    """构造一组可发送给主模型的既有工具调用与结果。"""
+    return [
+        Message(role="user", content="此前请求"),
+        Message(
+            role="assistant",
+            tool_calls=[
+                ToolCall(
+                    id="call_existing",
+                    function=FunctionCall(name="glob", arguments='{"pattern":"*.py"}'),
+                )
+            ],
+        ),
+        ToolMessage(
+            content="此前工具结果",
+            tool_call_id="call_existing",
+            name="glob",
+            consumed_by_main_model=consumed,
+        ),
+    ]
+
+
+def _context_usage_report(*, message_count: int = 3) -> ContextUsageReport:
+    """构造任务快照测试使用的上下文报告。"""
+    return ContextUsageReport(
+        estimated_tokens=120,
+        max_input_tokens=1_000,
+        occupancy_ratio=0.12,
+        message_count=message_count,
+        system_tokens=20,
+        message_tokens=90,
+        tools_tokens=10,
+        unconsumed_tool_result_count=1,
+    )
+
+
+def _seed_task_state(loop: AgentLoop) -> AgentTaskSnapshot:
+    """设置完整任务状态，并返回独立的预期快照。"""
+    loop.messages.extend(_tool_exchange())
+    loop.last_context_report = _context_usage_report()
+    loop.last_compaction_report = _compaction_report(
+        trigger=CompactionTrigger.MANUAL
+    )
+    loop.compaction_count = 7
+    loop.last_execution_plan = ExecutionPlan(
+        goal="此前计划",
+        steps=[PlanStep(index=1, title="保持原状")],
+    )
+    return AgentTaskSnapshot(
+        messages=[
+            message.model_copy(deep=True) for message in loop.messages
+        ],
+        last_context_report=loop.last_context_report.model_copy(deep=True),
+        last_compaction_report=loop.last_compaction_report.model_copy(deep=True),
+        compaction_count=loop.compaction_count,
+        last_execution_plan=loop.last_execution_plan.model_copy(deep=True),
+    )
+
+
+def _assert_task_state_restored(
+    loop: AgentLoop,
+    expected: AgentTaskSnapshot,
+) -> None:
+    """断言事务恢复了全部受保护状态。"""
+    assert loop.messages == expected.messages
+    assert loop.last_context_report == expected.last_context_report
+    assert loop.last_compaction_report == expected.last_compaction_report
+    assert loop.compaction_count == expected.compaction_count
+    assert loop.last_execution_plan == expected.last_execution_plan
 
 
 @pytest.mark.parametrize(
@@ -576,6 +672,300 @@ async def test_planning_preflight_runs_before_planner_without_tools(
     assert renderer.info_messages[-2:] == [
         compaction.format_compaction_report(report) for report in reports
     ]
+
+
+@pytest.mark.asyncio
+async def test_successful_assistant_commit_marks_sent_tool_results_consumed(
+    tmp_path: Path,
+    app_config: AppConfig,
+) -> None:
+    """主模型回复成功提交后，确认本次实际发送的既有工具结果。"""
+    provider = MockStepProvider([[
+        StreamChunk(type="text_delta", text="已处理此前结果"),
+        StreamChunk(type="done", usage=_make_usage()),
+    ]])
+    loop = AgentLoop(
+        provider=provider,
+        tool_registry=create_default_registry(),
+        renderer=MagicRenderer(),  # type: ignore[arg-type]
+        config=app_config,
+        workspace_root=tmp_path,
+    )
+    loop.messages.extend(_tool_exchange())
+
+    result = await loop.run("继续处理")
+
+    assert result == "已处理此前结果"
+    sent_messages = provider.calls[0]["messages"]
+    assert isinstance(sent_messages, list)
+    assert any(
+        isinstance(message, ToolMessage)
+        and message.tool_call_id == "call_existing"
+        for message in sent_messages
+    )
+    tool_result = next(
+        message for message in loop.messages if isinstance(message, ToolMessage)
+    )
+    assert tool_result.consumed_by_main_model is True
+
+
+@pytest.mark.asyncio
+async def test_provider_error_does_not_mark_tool_result_consumed(
+    tmp_path: Path,
+    app_config: AppConfig,
+) -> None:
+    """Provider 调用失败时不得确认本次发送的工具结果。"""
+    loop = AgentLoop(
+        provider=RaisingProvider(ProviderError("主模型调用失败")),
+        tool_registry=create_default_registry(),
+        renderer=MagicRenderer(),  # type: ignore[arg-type]
+        config=app_config,
+        workspace_root=tmp_path,
+    )
+    loop.messages.extend(_tool_exchange())
+
+    result = await loop.run("继续处理")
+
+    assert result is None
+    tool_result = next(
+        message for message in loop.messages if isinstance(message, ToolMessage)
+    )
+    assert tool_result.consumed_by_main_model is False
+
+
+@pytest.mark.asyncio
+async def test_last_round_tool_results_remain_unconsumed(
+    tmp_path: Path,
+    app_config: AppConfig,
+) -> None:
+    """最后一轮新生成的工具结果未再次发送，应保持未消费。"""
+    config = app_config.model_copy(deep=True)
+    config.agent.max_rounds = 1
+    provider = MockStepProvider([[
+        StreamChunk(type="text_delta", text="正在检查"),
+        StreamChunk(
+            type="tool_call_delta",
+            tool_call=PartialToolCall(
+                id="call_latest",
+                index=0,
+                name="glob",
+                arguments='{"pattern":"*.py"}',
+            ),
+        ),
+        StreamChunk(type="done", usage=_make_usage()),
+    ]])
+    loop = AgentLoop(
+        provider=provider,
+        tool_registry=create_default_registry(),
+        renderer=MagicRenderer(),  # type: ignore[arg-type]
+        config=config,
+        workspace_root=tmp_path,
+    )
+    loop.messages.extend(_tool_exchange())
+
+    result = await loop.run("检查文件")
+
+    assert result == "正在检查"
+    tool_results = {
+        message.tool_call_id: message
+        for message in loop.messages
+        if isinstance(message, ToolMessage)
+    }
+    assert tool_results["call_existing"].consumed_by_main_model is True
+    assert tool_results["call_latest"].consumed_by_main_model is False
+
+
+@pytest.mark.asyncio
+async def test_failure_restores_compaction_and_consumption_snapshot(
+    tmp_path: Path,
+    app_config: AppConfig,
+) -> None:
+    """规划成功后 ReAct 失败时，深快照恢复全部任务级状态。"""
+
+    class CopyingCompactor:
+        def __init__(self) -> None:
+            self.call_count = 0
+
+        async def compact(
+            self,
+            messages: list[Message],
+            system_prompt: str,
+            tools_schema: list[dict],
+            trigger: CompactionTrigger,
+            focus: str | None = None,
+        ) -> CompactionResult:
+            self.call_count += 1
+            return CompactionResult(
+                messages=[message.model_copy(deep=True) for message in messages],
+                report=_compaction_report().model_copy(
+                    update={"before_tokens": 20_000 + self.call_count}
+                ),
+                changed=True,
+            )
+
+    class PlanningThenFailProvider(BaseProvider):
+        def __init__(self) -> None:
+            self.call_count = 0
+            self.tool_consumed_before_failure = False
+
+        @property
+        def name(self) -> str:
+            return "planning-then-fail"
+
+        async def chat(
+            self,
+            messages: list[Message],
+            tools: list[dict] | None = None,
+            stream: bool = True,
+            max_tokens: int | None = None,
+        ) -> AsyncIterator[StreamChunk]:
+            self.call_count += 1
+            if self.call_count == 1:
+                yield StreamChunk(
+                    type="text_delta",
+                    text='{"goal":"继续任务","steps":[{"title":"执行"}]}',
+                )
+                yield StreamChunk(type="done")
+                return
+
+            self.tool_consumed_before_failure = any(
+                isinstance(message, ToolMessage)
+                and message.tool_call_id == "call_existing"
+                and message.consumed_by_main_model
+                for message in messages
+            )
+            raise ProviderError("ReAct 调用失败")
+
+        async def list_models(self) -> list[str]:
+            return []
+
+    config = app_config.model_copy(deep=True)
+    config.agent.planning.enabled = True
+    config.agent.context.compaction = _auto_compaction_config()
+    provider = PlanningThenFailProvider()
+    loop = AgentLoop(
+        provider=provider,
+        tool_registry=create_default_registry(),
+        renderer=MagicRenderer(),  # type: ignore[arg-type]
+        config=config,
+        workspace_root=tmp_path,
+    )
+    expected = _seed_task_state(loop)
+    compactor = CopyingCompactor()
+    loop.context_compactor = compactor  # type: ignore[assignment]
+
+    result = await loop.run("继续处理")
+
+    assert result is None
+    assert provider.tool_consumed_before_failure is True
+    assert compactor.call_count > 0
+    _assert_task_state_restored(loop, expected)
+
+
+def test_task_snapshot_is_deeply_isolated(
+    tmp_path: Path,
+    app_config: AppConfig,
+) -> None:
+    """快照与恢复后的可变 Pydantic 对象均不共享引用。"""
+    loop = AgentLoop(
+        provider=MockStepProvider([]),
+        tool_registry=create_default_registry(),
+        renderer=MagicRenderer(),  # type: ignore[arg-type]
+        config=app_config,
+        workspace_root=tmp_path,
+    )
+    expected = _seed_task_state(loop)
+    snapshot = loop._take_task_snapshot()
+
+    tool_message = next(
+        message for message in loop.messages if isinstance(message, ToolMessage)
+    )
+    tool_message.content = "任务中污染"
+    loop.last_context_report.message_count = 999  # type: ignore[union-attr]
+    loop.last_compaction_report.before_tokens = 999  # type: ignore[union-attr]
+    loop.last_execution_plan.steps[0].title = "任务中污染"  # type: ignore[union-attr]
+
+    assert snapshot == expected
+
+    loop._restore_task_snapshot(snapshot)
+    restored_tool = next(
+        message for message in loop.messages if isinstance(message, ToolMessage)
+    )
+    restored_tool.content = "恢复后污染"
+    loop.last_context_report.message_count = 888  # type: ignore[union-attr]
+    loop.last_compaction_report.before_tokens = 888  # type: ignore[union-attr]
+    loop.last_execution_plan.steps[0].title = "恢复后污染"  # type: ignore[union-attr]
+
+    assert snapshot == expected
+
+
+@pytest.mark.asyncio
+async def test_cancelled_task_restores_snapshot_and_reraises(
+    tmp_path: Path,
+    app_config: AppConfig,
+) -> None:
+    """任务取消时恢复深快照，并把取消继续抛给调用方。"""
+    loop = AgentLoop(
+        provider=RaisingProvider(asyncio.CancelledError()),
+        tool_registry=create_default_registry(),
+        renderer=MagicRenderer(),  # type: ignore[arg-type]
+        config=app_config,
+        workspace_root=tmp_path,
+    )
+    expected = _seed_task_state(loop)
+
+    with pytest.raises(asyncio.CancelledError):
+        await loop.run("会被取消")
+
+    _assert_task_state_restored(loop, expected)
+
+
+@pytest.mark.asyncio
+async def test_none_result_restores_deep_task_snapshot(
+    tmp_path: Path,
+    app_config: AppConfig,
+) -> None:
+    """主模型空结果的非异常路径也恢复全部任务状态。"""
+
+    loop = AgentLoop(
+        provider=MockStepProvider([[StreamChunk(type="done")]]),
+        tool_registry=create_default_registry(),
+        renderer=MagicRenderer(),  # type: ignore[arg-type]
+        config=app_config,
+        workspace_root=tmp_path,
+    )
+    expected = _seed_task_state(loop)
+
+    result = await loop.run("返回空结果")
+
+    assert result is None
+    _assert_task_state_restored(loop, expected)
+
+
+@pytest.mark.asyncio
+async def test_unexpected_error_restores_snapshot_and_returns_none(
+    tmp_path: Path,
+    app_config: AppConfig,
+) -> None:
+    """未知异常统一回滚，并显示中文任务失败提示。"""
+    renderer = MagicRenderer()
+    loop = AgentLoop(
+        provider=RaisingProvider(RuntimeError("意外故障")),
+        tool_registry=create_default_registry(),
+        renderer=renderer,  # type: ignore[arg-type]
+        config=app_config,
+        workspace_root=tmp_path,
+    )
+    loop.messages.extend(_tool_exchange())
+    expected_messages = [
+        message.model_copy(deep=True) for message in loop.messages
+    ]
+
+    result = await loop.run("触发未知异常")
+
+    assert result is None
+    assert loop.messages == expected_messages
+    assert renderer.error_messages[-1] == "任务执行失败：意外故障"
 
 
 # ─── Test 1: 无工具直接回答 ────────────────────────────────────────
@@ -1096,9 +1486,9 @@ async def test_max_rounds_exceeded(tmp_path: Path, app_config: AppConfig) -> Non
 
     # 应该执行了 max_rounds 次（而非不限制地继续）
     assert provider.call_count == app_config.agent.max_rounds
-    # 历史中应只有 max_rounds 个 assistant 消息
-    assistant_msgs = [m for m in loop.messages if m.role == "assistant"]
-    assert len(assistant_msgs) == app_config.agent.max_rounds
+    # 纯工具调用达到上限时结果为 None，整个任务应按事务语义回滚
+    assert response is None
+    assert loop.messages == []
 
 
 # ─── Test 6: 流式响应错误处理 ──────────────────────────────────────

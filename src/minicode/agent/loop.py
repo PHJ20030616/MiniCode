@@ -85,6 +85,17 @@ class ToolBlock:
     tool_calls: list[ToolCall]
 
 
+@dataclass
+class AgentTaskSnapshot:
+    """单次任务开始前需要事务保护的 Agent 状态。"""
+
+    messages: list[Message]
+    last_context_report: ContextUsageReport | None
+    last_compaction_report: CompactionReport | None
+    compaction_count: int
+    last_execution_plan: ExecutionPlan | None
+
+
 class AgentLoop:
     """ReAct Agent Loop。
 
@@ -162,6 +173,72 @@ class AgentLoop:
             memory_content=memory_content,
             memory_enabled=self._memory_enabled,
         )
+
+    def _take_task_snapshot(self) -> AgentTaskSnapshot:
+        """深拷贝任务级状态，隔离执行期间的原地修改。"""
+        return AgentTaskSnapshot(
+            messages=[
+                message.model_copy(deep=True) for message in self.messages
+            ],
+            last_context_report=(
+                self.last_context_report.model_copy(deep=True)
+                if self.last_context_report is not None
+                else None
+            ),
+            last_compaction_report=(
+                self.last_compaction_report.model_copy(deep=True)
+                if self.last_compaction_report is not None
+                else None
+            ),
+            compaction_count=self.compaction_count,
+            last_execution_plan=(
+                self.last_execution_plan.model_copy(deep=True)
+                if self.last_execution_plan is not None
+                else None
+            ),
+        )
+
+    def _restore_task_snapshot(self, snapshot: AgentTaskSnapshot) -> None:
+        """从深快照恢复状态，且不向后续任务暴露快照内部对象。"""
+        self.messages.clear()
+        self.messages.extend(
+            message.model_copy(deep=True) for message in snapshot.messages
+        )
+        self.last_context_report = (
+            snapshot.last_context_report.model_copy(deep=True)
+            if snapshot.last_context_report is not None
+            else None
+        )
+        self.last_compaction_report = (
+            snapshot.last_compaction_report.model_copy(deep=True)
+            if snapshot.last_compaction_report is not None
+            else None
+        )
+        self.compaction_count = snapshot.compaction_count
+        self.last_execution_plan = (
+            snapshot.last_execution_plan.model_copy(deep=True)
+            if snapshot.last_execution_plan is not None
+            else None
+        )
+
+    @staticmethod
+    def _unconsumed_tool_ids(messages: list[Message]) -> set[str]:
+        """返回消息中尚未被主模型消费的工具调用 ID。"""
+        return {
+            message.tool_call_id
+            for message in messages
+            if isinstance(message, ToolMessage)
+            and not message.consumed_by_main_model
+        }
+
+    def _mark_tool_results_consumed(self, tool_call_ids: set[str]) -> None:
+        """确认当前历史中指定 ID 的工具结果已被主模型消费。"""
+        for message in self.messages:
+            if (
+                isinstance(message, ToolMessage)
+                and message.tool_call_id in tool_call_ids
+            ):
+                message.consumed_by_main_model = True
 
     def _get_tools_schema(self) -> list[dict]:
         """获取主 Agent 工具 schema，并按记忆配置过滤 remember。"""
@@ -249,6 +326,7 @@ class AgentLoop:
             PLANNING_SYSTEM_PROMPT,
             [],
         )
+        sent_unconsumed_tool_ids = self._unconsumed_tool_ids(api_messages)
         planner = TaskPlanner(
             provider=self.provider,
             planning_config=self.config.agent.planning,
@@ -262,11 +340,12 @@ class AgentLoop:
         plan_markdown = plan.to_markdown()
         self.renderer.console.print(Markdown(plan_markdown))
         self.messages.append(Message(role="assistant", content=plan_markdown))
+        self._mark_tool_results_consumed(sent_unconsumed_tool_ids)
         self.last_execution_plan = plan
         return plan
 
     async def run(self, user_input: str, *, force_plan: bool = False) -> str | None:
-        """运行 ReAct 循环处理用户输入。
+        """以任务级事务运行 ReAct 循环。
 
         Args:
             user_input: 用户输入文本。
@@ -275,25 +354,48 @@ class AgentLoop:
         Returns:
             最终回复文本。若过程中出现无法恢复的错误则返回 None。
         """
-        history_len = len(self.messages)  # 记录初始长度，用于错误回滚
+        snapshot = self._take_task_snapshot()
         self.messages.append(Message(role="user", content=user_input))
         self.last_execution_plan = None
         self._subagents_started_this_run = 0
 
+        try:
+            result = await self._run_task(user_input, force_plan=force_plan)
+        except asyncio.CancelledError:
+            self._restore_task_snapshot(snapshot)
+            raise
+        except ProviderError as e:
+            self._restore_task_snapshot(snapshot)
+            logger.debug("Provider 调用失败", error=str(e))
+            self.renderer.show_error(f"{e}")
+            return None
+        except Exception as e:
+            self._restore_task_snapshot(snapshot)
+            logger.debug("任务执行失败", error=str(e), exc_info=True)
+            self.renderer.show_error(f"任务执行失败：{e}")
+            return None
+
+        if result is None:
+            self._restore_task_snapshot(snapshot)
+        return result
+
+    async def _run_task(
+        self,
+        user_input: str,
+        *,
+        force_plan: bool = False,
+    ) -> str | None:
+        """执行已进入事务的规划与 ReAct 主体。"""
         try:
             if force_plan or self.config.agent.planning.enabled:
                 await self._create_execution_plan(user_input)
         except (ContextCompactionError, ContextWindowExceededError) as e:
             logger.debug("规划上下文准备失败", error=str(e))
             self.renderer.show_error(f"规划上下文准备失败：{e}")
-            del self.messages[history_len:]
-            self.last_execution_plan = None
             return None
         except ProviderError as e:
             logger.debug("规划阶段失败", error=str(e))
             self.renderer.show_error(f"计划生成失败：{e}")
-            del self.messages[history_len:]
-            self.last_execution_plan = None
             return None
 
         logger.debug("AgentLoop 开始", max_rounds=self.config.agent.max_rounds)
@@ -310,8 +412,9 @@ class AgentLoop:
             except (ContextCompactionError, ContextWindowExceededError) as e:
                 logger.debug("ReAct 上下文准备失败", round=round_num, error=str(e))
                 self.renderer.show_error(f"上下文准备失败：{e}")
-                del self.messages[history_len:]
                 return None
+
+            sent_unconsumed_tool_ids = self._unconsumed_tool_ids(api_messages)
 
             # 调用 Provider
             try:
@@ -327,7 +430,6 @@ class AgentLoop:
             except ProviderError as e:
                 logger.debug("Provider 调用失败", round=round_num, error=str(e))
                 self.renderer.show_error(f"{e}")
-                del self.messages[history_len:]  # 回滚本轮所有消息
                 return None
 
             # 处理流式响应：渲染文本 + 收集 tool_call
@@ -336,12 +438,10 @@ class AgentLoop:
             except ProviderError as e:
                 logger.debug("Provider 流式处理失败", round=round_num, error=str(e))
                 self.renderer.show_error(f"{e}")
-                del self.messages[history_len:]  # 回滚本轮所有消息
                 return None
 
             # 如果流式处理中发生错误
             if text_content is None and tool_calls is None:
-                del self.messages[history_len:]  # 回滚本轮所有消息
                 return None
 
             # 构建 assistant 消息并追加到历史
@@ -351,6 +451,7 @@ class AgentLoop:
                 tool_calls=tool_calls or None,
             )
             self.messages.append(assistant_msg)
+            self._mark_tool_results_consumed(sent_unconsumed_tool_ids)
 
             # 显示 token 用量
             if usage:
