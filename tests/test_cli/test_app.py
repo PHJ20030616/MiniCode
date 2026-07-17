@@ -297,6 +297,62 @@ class TestHandleMessage:
 class TestSessionStatePersistence:
     """测试 ChatApp 与 Session 之间的压缩状态同步。"""
 
+    async def test_lazy_agent_loop_restores_switched_session_before_first_save(
+        self, chat_app: ChatApp, tmp_path: Path
+    ) -> None:
+        """首次创建 AgentLoop 时应恢复此前切换到的会话状态。"""
+        chat_app.workspace_root = tmp_path
+        manager = chat_app._get_session_manager()
+        target = manager.create()
+        target.messages.append(
+            Message(
+                role="user",
+                content=[ContentBlock(type="text", text="目标任务")],
+            )
+        )
+        target.metadata.update(
+            {
+                "compaction_count": "9",
+                "last_compaction": _compaction_report().model_dump(mode="json"),
+                "initial_user_summary": "  目标任务概要  ",
+            }
+        )
+
+        await chat_app._on_session_switched(target)
+
+        assert chat_app._agent_loop is None
+        with patch(
+            "minicode.cli.app.ProviderRegistry.get",
+            return_value=MockProvider("回复"),
+        ):
+            agent_loop = chat_app._get_agent_loop()
+
+        assert agent_loop.messages == target.messages
+        assert agent_loop.messages[0] is not target.messages[0]
+        assert agent_loop.compaction_count == 9
+        assert agent_loop.last_compaction_report == _compaction_report()
+        assert chat_app._initial_user_summary == "目标任务概要"
+
+        loop_content = agent_loop.messages[0].content
+        session_content = target.messages[0].content
+        assert isinstance(loop_content, list)
+        assert isinstance(session_content, list)
+        loop_content[0].text = "已继续处理"
+        assert session_content[0].text == "目标任务"
+
+        await chat_app._auto_save(agent_loop)
+
+        saved = manager.load(target.id)
+        assert saved is not None
+        assert saved.messages[0].content == [
+            ContentBlock(type="text", text="已继续处理")
+        ]
+        assert saved.metadata["compaction_count"] == 9
+        assert saved.metadata["last_compaction"] == _compaction_report().model_dump(
+            mode="json"
+        )
+        assert saved.metadata["initial_user_summary"] == "目标任务概要"
+
     async def test_auto_save_persists_compaction_state_and_deep_copies_messages(
         self, chat_app: ChatApp, tmp_path: Path
     ) -> None:

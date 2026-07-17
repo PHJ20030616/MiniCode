@@ -195,6 +195,9 @@ class ChatApp:
             permission_store=permission_store,
             permission_confirmer=permission_confirmer,
         )
+        # 会话可能在首次对话前已切换，此时需在懒加载完成后补做状态恢复。
+        if self._current_session is not None:
+            self._restore_session_to_agent(self._current_session, self._agent_loop)
         return self._agent_loop
 
     def _get_session_manager(self) -> SessionManager:
