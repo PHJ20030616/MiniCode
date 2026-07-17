@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from minicode.agent.context_models import ContextBuildReport, ContextUsageReport
+from minicode.agent.context_models import CompactionTrigger
 from minicode.commands.base import BaseCommand, CommandContext, CommandResult
 
 
@@ -17,8 +17,6 @@ class ContextCommand(BaseCommand):
     async def execute(self, args: str, ctx: CommandContext) -> CommandResult:
         """显示上下文诊断统计。
 
-        通过 AgentLoop 的 last_context_report 获取最新上下文构建报告。
-
         Args:
             args: 命令参数（忽略）。
             ctx: 命令执行上下文。
@@ -27,38 +25,47 @@ class ContextCommand(BaseCommand):
             CommandResult，包含上下文统计信息或提示文本。
         """
         agent_loop = ctx.agent_loop
-        if agent_loop is None or agent_loop.last_context_report is None:
+        if agent_loop is None:
             return CommandResult(message="尚未开始对话，暂无上下文统计。")
 
-        report: ContextUsageReport | ContextBuildReport = (
-            agent_loop.last_context_report
-        )
+        usage = agent_loop.get_context_usage()
+        compaction_config = agent_loop.config.agent.context.compaction
+        lines = [
+            "上下文窗口状态：",
+            (
+                f"当前占用：{usage.estimated_tokens:,} / "
+                f"{usage.max_input_tokens:,} 词元（{usage.occupancy_ratio:.1%}）"
+            ),
+            f"自动压缩阈值：{compaction_config.trigger_ratio:.1%}",
+            f"压缩目标：{compaction_config.target_ratio:.1%}",
+            f"当前消息数：{usage.message_count:,}",
+        ]
 
-        lines: list[str] = []
-        lines.append("上下文窗口统计：")
-        lines.append("")
-        if isinstance(report, ContextUsageReport):
-            lines.append(f"  当前消息数：            {report.message_count:,}")
-            lines.append(
-                "  估算词元：              "
-                f"{report.estimated_tokens:,} / {report.max_input_tokens:,}"
-            )
-            lines.append(f"  占用率：                {report.occupancy_ratio:.1%}")
-            lines.append(f"  系统提示词元：          {report.system_tokens:,}")
-            lines.append(f"  消息词元：              {report.message_tokens:,}")
-            lines.append(f"  工具定义词元：          {report.tools_tokens:,}")
-        else:
-            lines.append(f"  原始消息数：            {report.original_message_count}")
-            lines.append(f"  发送消息数：            {report.final_message_count}")
-            lines.append(
-                f"  原始估算词元数：        {report.original_estimated_tokens}"
-            )
-            lines.append(
-                f"  发送估算词元数：        {report.final_estimated_tokens}"
-            )
-            lines.append(f"  裁剪消息数：            {report.dropped_message_count}")
-            lines.append(
-                f"  压缩工具结果数：        {report.compressed_tool_result_count}"
-            )
+        report = agent_loop.last_compaction_report
+        if report is None:
+            lines.append("最近压缩：无")
+            return CommandResult(message="\n".join(lines))
+
+        trigger_label = (
+            "自动"
+            if report.trigger == CompactionTrigger.AUTOMATIC
+            else "手动"
+        )
+        lines.extend(
+            [
+                f"最近压缩：{trigger_label}",
+                (
+                    "压缩时间："
+                    f"{report.created_at.astimezone().strftime('%Y-%m-%d %H:%M:%S')}"
+                ),
+                f"压缩前消息数：{report.before_message_count:,}",
+                f"已清理工具结果数：{report.cleared_tool_result_count:,}",
+                (
+                    "当前未消费工具结果数："
+                    f"{usage.unconsumed_tool_result_count:,}"
+                ),
+                f"总结重试：{'是' if report.retry_used else '否'}",
+            ]
+        )
 
         return CommandResult(message="\n".join(lines))

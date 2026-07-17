@@ -21,7 +21,7 @@ class TestFullCommandChain:
     """命令注册 → 路由 → 执行 完整链路测试。"""
 
     def test_all_commands_registered(self) -> None:
-        """register_all_commands 应注册 5 个命令。"""
+        """register_all_commands 应注册 8 个命令。"""
         CommandRegistry._commands.clear()
         CommandRegistry._aliases.clear()
 
@@ -29,7 +29,16 @@ class TestFullCommandChain:
 
         all_cmds = CommandRegistry.list_all()
         names = {c.name for c in all_cmds}
-        assert names == {"quit", "help", "clear", "session", "config", "memory", "context"}
+        assert names == {
+            "quit",
+            "help",
+            "clear",
+            "session",
+            "config",
+            "memory",
+            "compact",
+            "context",
+        }
 
     def test_quit_aliases_findable(self) -> None:
         """别名的命令应可通过别名查找。"""

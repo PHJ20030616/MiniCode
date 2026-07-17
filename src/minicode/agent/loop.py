@@ -31,6 +31,7 @@ from minicode.agent.compaction import ContextCompactor, format_compaction_report
 from minicode.agent.context import build_strict_messages, estimate_context_usage
 from minicode.agent.context_models import (
     CompactionReport,
+    CompactionResult,
     CompactionTrigger,
     ContextUsageReport,
 )
@@ -250,6 +251,46 @@ class AgentLoop:
             for tool in tools_schema
             if tool.get("function", {}).get("name") != "remember"
         ]
+
+    def get_context_usage(self) -> ContextUsageReport:
+        """返回当前 Agent 历史的实时上下文用量估算。"""
+        tools_schema = self._get_tools_schema()
+        return estimate_context_usage(
+            messages=self.messages,
+            system_prompt=self.system_prompt,
+            tools_schema=tools_schema,
+            max_input_tokens=self.config.agent.context.max_input_tokens,
+        )
+
+    async def compact_context(
+        self,
+        focus: str | None = None,
+    ) -> CompactionResult:
+        """手动压缩当前旧上下文，并在成功时提交压缩状态。"""
+        tools_schema = self._get_tools_schema()
+        result = await self.context_compactor.compact(
+            messages=self.messages,
+            system_prompt=self.system_prompt,
+            tools_schema=tools_schema,
+            trigger=CompactionTrigger.MANUAL,
+            focus=focus,
+        )
+        if not result.changed:
+            return result
+
+        # 压缩器已完成候选校验；保留列表对象，避免破坏外部状态引用。
+        self.messages.clear()
+        self.messages.extend(result.messages)
+        self.last_compaction_report = result.report
+        self.compaction_count += 1
+        strict = build_strict_messages(
+            self.messages,
+            self.system_prompt,
+            tools_schema,
+            self.config.agent.context,
+        )
+        self.last_context_report = strict.report
+        return result
 
     async def _prepare_main_call(
         self,

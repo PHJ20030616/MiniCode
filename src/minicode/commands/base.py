@@ -24,6 +24,8 @@ class CommandResult(BaseModel):
     """显示给用户的文本消息。None 表示无输出。"""
     success: bool = True
     """命令是否执行成功。失败时 message 包含错误描述。"""
+    history_changed: bool = False
+    """命令是否修改了 AgentLoop 历史；ChatApp 据此统一保存会话。"""
 
 
 class CommandContext(BaseModel):

@@ -399,6 +399,9 @@ class ChatApp:
             else:
                 self.renderer.show_error(result.message)
 
+        if result.history_changed and self._agent_loop is not None:
+            await self._auto_save(self._agent_loop)
+
         return result.should_exit
 
     def _build_command_context(self) -> CommandContext:

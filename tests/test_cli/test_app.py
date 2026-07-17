@@ -11,6 +11,7 @@ import pytest
 from minicode.agent import AgentLoop
 from minicode.agent.subagents.models import SubagentConfig
 from minicode.cli.app import ChatApp
+from minicode.commands.base import CommandResult
 from minicode.config.models import AgentConfig, AppConfig, PermissionsConfig, ProviderConfig
 from minicode.providers.base import Message
 from minicode.providers.registry import MockProvider
@@ -398,3 +399,71 @@ class TestCommandRouting:
         """仅输入 '/' 应显示友好错误，不应崩溃。"""
         should_exit = await chat_app._handle_input("/")
         assert should_exit is False
+
+    async def test_history_changed_command_auto_saves_once(
+        self,
+        chat_app: ChatApp,
+    ) -> None:
+        """命令修改历史后应恰好自动保存一次。"""
+        command = MagicMock()
+        command.execute = AsyncMock(
+            return_value=CommandResult(
+                message="上下文已压缩。",
+                history_changed=True,
+            )
+        )
+        agent_loop = MagicMock(spec=AgentLoop)
+        chat_app._agent_loop = agent_loop
+        chat_app._auto_save = AsyncMock()  # type: ignore[method-assign]
+
+        with patch(
+            "minicode.cli.app.CommandRegistry.find",
+            return_value=command,
+        ):
+            should_exit = await chat_app._handle_command("/compact")
+
+        assert should_exit is False
+        chat_app._auto_save.assert_awaited_once_with(agent_loop)
+
+    async def test_unchanged_command_does_not_auto_save(
+        self,
+        chat_app: ChatApp,
+    ) -> None:
+        """命令未修改历史时不应自动保存。"""
+        command = MagicMock()
+        command.execute = AsyncMock(
+            return_value=CommandResult(
+                message="当前没有可压缩的历史上下文。",
+                history_changed=False,
+            )
+        )
+        chat_app._agent_loop = MagicMock(spec=AgentLoop)
+        chat_app._auto_save = AsyncMock()  # type: ignore[method-assign]
+
+        with patch(
+            "minicode.cli.app.CommandRegistry.find",
+            return_value=command,
+        ):
+            await chat_app._handle_command("/compact")
+
+        chat_app._auto_save.assert_not_awaited()
+
+    async def test_history_changed_without_agent_loop_does_not_auto_save(
+        self,
+        chat_app: ChatApp,
+    ) -> None:
+        """即使命令误报历史变化，无 AgentLoop 时也不保存。"""
+        command = MagicMock()
+        command.execute = AsyncMock(
+            return_value=CommandResult(history_changed=True)
+        )
+        chat_app._agent_loop = None
+        chat_app._auto_save = AsyncMock()  # type: ignore[method-assign]
+
+        with patch(
+            "minicode.cli.app.CommandRegistry.find",
+            return_value=command,
+        ):
+            await chat_app._handle_command("/compact")
+
+        chat_app._auto_save.assert_not_awaited()
