@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -254,6 +255,77 @@ class TestHandleMessage:
 
         assert chat_app._current_session is None
         assert chat_app._initial_user_summary is None
+
+    @pytest.mark.parametrize(
+        "failure_mode",
+        ["none", "error", "cancel", "save_error", "save_noop"],
+    )
+    async def test_failed_first_task_in_empty_session_rolls_back_summary(
+        self,
+        chat_app: ChatApp,
+        tmp_path: Path,
+        failure_mode: str,
+    ) -> None:
+        """空 Session 中首次任务未提交时，下一次成功输入应成为稳定概要。"""
+        chat_app.workspace_root = tmp_path
+        with patch(
+            "minicode.cli.app.ProviderRegistry.get",
+            return_value=MockProvider("模拟回复"),
+        ):
+            agent_loop = chat_app._get_agent_loop()
+        await chat_app._clear_and_new_session()
+
+        async def failed_run(user_input: str) -> str | None:
+            assert chat_app._initial_user_summary == "失败任务"
+            if failure_mode == "error":
+                raise RuntimeError("任务失败")
+            if failure_mode == "cancel":
+                raise asyncio.CancelledError
+            if failure_mode.startswith("save_"):
+                agent_loop.messages.extend(
+                    [
+                        Message(role="user", content=user_input),
+                        Message(role="assistant", content="已完成但保存失败"),
+                    ]
+                )
+                return "已完成但保存失败"
+            return None
+
+        agent_loop.run = failed_run  # type: ignore[method-assign]
+
+        if failure_mode == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await chat_app._handle_message("失败任务")
+        elif failure_mode == "save_error":
+            manager = chat_app._get_session_manager()
+            with patch.object(manager, "save", side_effect=OSError("磁盘不可写")):
+                await chat_app._handle_message("失败任务")
+        elif failure_mode == "save_noop":
+            manager = chat_app._get_session_manager()
+            with patch.object(manager, "save"):
+                await chat_app._handle_message("失败任务")
+        else:
+            await chat_app._handle_message("失败任务")
+
+        assert chat_app._initial_user_summary is None
+        assert chat_app._current_session is not None
+        assert "initial_user_summary" not in chat_app._current_session.metadata
+
+        async def successful_run(user_input: str) -> str | None:
+            agent_loop.messages.extend(
+                [
+                    Message(role="user", content=user_input),
+                    Message(role="assistant", content="已完成"),
+                ]
+            )
+            return "已完成"
+
+        agent_loop.run = successful_run  # type: ignore[method-assign]
+        await chat_app._handle_message("成功任务")
+
+        assert chat_app._initial_user_summary == "成功任务"
+        assert chat_app._current_session is not None
+        assert chat_app._current_session.metadata["initial_user_summary"] == "成功任务"
 
     async def test_successful_first_task_persists_initial_summary(
         self, chat_app: ChatApp, tmp_path: Path
@@ -529,6 +601,135 @@ class TestSessionStatePersistence:
         assert agent_loop.last_compaction_report is None
         assert agent_loop.compaction_count == 0
         assert chat_app._initial_user_summary is None
+
+    @pytest.mark.parametrize(
+        ("invalid_metadata", "expected_count", "expected_report"),
+        [
+            ({"compaction_count": "坏数据"}, 0, None),
+            (
+                {
+                    "compaction_count": 2,
+                    "last_compaction": {"trigger": "manual"},
+                },
+                2,
+                None,
+            ),
+        ],
+    )
+    async def test_switch_with_invalid_metadata_restores_transactionally(
+        self,
+        chat_app: ChatApp,
+        tmp_path: Path,
+        invalid_metadata: dict[str, Any],
+        expected_count: int,
+        expected_report: CompactionReport | None,
+    ) -> None:
+        """异常压缩元数据应保守回退，且不能让 Agent 与当前 Session 错配。"""
+        chat_app.workspace_root = tmp_path
+        manager = chat_app._get_session_manager()
+        source = manager.create()
+        target = manager.create()
+        target.messages.extend(
+            [
+                Message(role="user", content="目标任务"),
+                Message(role="assistant", content="目标回复"),
+            ]
+        )
+        target.metadata.update(invalid_metadata)
+        manager.save(target)
+        chat_app._current_session = source
+        with patch(
+            "minicode.cli.app.ProviderRegistry.get",
+            return_value=MockProvider("回复"),
+        ):
+            agent_loop = chat_app._get_agent_loop()
+        agent_loop.messages.extend(
+            [
+                Message(role="user", content="源任务"),
+                Message(role="assistant", content="源回复"),
+            ]
+        )
+        chat_app._initial_user_summary = "源任务"
+
+        switched = await chat_app.switch_session(target.id)
+
+        assert switched is True
+        assert chat_app._current_session is not None
+        assert chat_app._current_session.id == target.id
+        assert agent_loop.messages == target.messages
+        assert agent_loop.compaction_count == expected_count
+        assert agent_loop.last_compaction_report == expected_report
+
+        await chat_app._auto_save(agent_loop)
+        saved_source = manager.load(source.id)
+        assert saved_source is not None
+        assert [message.content for message in saved_source.messages] == [
+            "源任务",
+            "源回复",
+        ]
+
+    async def test_legacy_session_derives_and_persists_initial_user_summary(
+        self, chat_app: ChatApp, tmp_path: Path
+    ) -> None:
+        """旧会话应跳过内部摘要，从首条真实用户消息恢复稳定概要。"""
+        chat_app.workspace_root = tmp_path
+        manager = chat_app._get_session_manager()
+        target = manager.create()
+        target.messages.extend(
+            [
+                Message(role="system", content="内部系统提示"),
+                Message(
+                    role="user",
+                    content="压缩生成的内部摘要",
+                    kind="compact_summary",
+                ),
+                Message(role="assistant", content="历史回复"),
+                Message(
+                    role="user",
+                    content=[
+                        ContentBlock(
+                            type="text",
+                            text="  一二三四五六七八九十一二三四五六  ",
+                        )
+                    ],
+                ),
+                Message(role="assistant", content="真实任务回复"),
+            ]
+        )
+        manager.save(target)
+        with patch(
+            "minicode.cli.app.ProviderRegistry.get",
+            return_value=MockProvider("回复"),
+        ):
+            chat_app._get_agent_loop()
+
+        switched = await chat_app.switch_session(target.id)
+
+        assert switched is True
+        assert chat_app._initial_user_summary == "一二三四五六七八九十一二三四五..."
+
+        agent_loop = chat_app._agent_loop
+        assert agent_loop is not None
+
+        async def successful_run(user_input: str) -> str | None:
+            assert chat_app._initial_user_summary == "一二三四五六七八九十一二三四五..."
+            agent_loop.messages.extend(
+                [
+                    Message(role="user", content=user_input),
+                    Message(role="assistant", content="续问已完成"),
+                ]
+            )
+            return "续问已完成"
+
+        agent_loop.run = successful_run  # type: ignore[method-assign]
+        await chat_app._handle_message("这是一条续问")
+
+        saved = manager.load(target.id)
+        assert saved is not None
+        assert (
+            saved.metadata["initial_user_summary"]
+            == "一二三四五六七八九十一二三四五..."
+        )
 
     async def test_clear_resets_compaction_state_and_initial_summary(
         self, chat_app: ChatApp, tmp_path: Path

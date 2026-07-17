@@ -232,6 +232,46 @@ class ChatApp:
             )
         if self._initial_user_summary:
             session.metadata["initial_user_summary"] = self._initial_user_summary
+        else:
+            session.metadata.pop("initial_user_summary", None)
+
+    @staticmethod
+    def _parse_compaction_count(value: Any) -> int:
+        """保守解析压缩次数，旧版或损坏元数据统一回退为 0。"""
+        if isinstance(value, bool):
+            return 0
+        if isinstance(value, int):
+            return value if value >= 0 else 0
+        if isinstance(value, str):
+            try:
+                parsed = int(value)
+            except ValueError:
+                return 0
+            return parsed if parsed >= 0 else 0
+        return 0
+
+    @staticmethod
+    def _parse_compaction_report(value: Any) -> CompactionReport | None:
+        """保守解析压缩报告，无法验证的历史格式视为无报告。"""
+        if not isinstance(value, dict):
+            return None
+        try:
+            return CompactionReport.model_validate(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _restore_initial_user_summary(session: Session) -> tuple[str | None, bool]:
+        """恢复稳定概要，并标记是否由旧会话消息推导得到。"""
+        initial_summary = session.metadata.get("initial_user_summary")
+        if isinstance(initial_summary, str) and initial_summary.strip():
+            return initial_summary.strip(), False
+
+        for message in session.messages:
+            if message.role != "user" or message.kind == "compact_summary":
+                continue
+            return summarize_user_input(message.content), True
+        return None, False
 
     def _restore_session_to_agent(
         self,
@@ -239,34 +279,38 @@ class ChatApp:
         agent_loop: AgentLoop,
     ) -> None:
         """从 Session 恢复 AgentLoop 状态，并保持消息对象相互独立。"""
-        agent_loop.messages.clear()
-        agent_loop.messages.extend(
+        # 先在局部变量中完成复制与元数据解析，避免异常造成半恢复状态。
+        restored_messages = [
             message.model_copy(deep=True)
             for message in session.messages
-        )
-        agent_loop.compaction_count = int(
+        ]
+        restored_count = self._parse_compaction_count(
             session.metadata.get("compaction_count", 0)
         )
-        report_data = session.metadata.get("last_compaction")
-        agent_loop.last_compaction_report = (
-            CompactionReport.model_validate(report_data)
-            if isinstance(report_data, dict)
-            else None
+        restored_report = self._parse_compaction_report(
+            session.metadata.get("last_compaction")
         )
-        initial_summary = session.metadata.get("initial_user_summary")
-        self._initial_user_summary = (
-            initial_summary.strip()
-            if isinstance(initial_summary, str) and initial_summary.strip()
-            else None
+        restored_summary, summary_was_derived = (
+            self._restore_initial_user_summary(session)
         )
 
-    async def _auto_save(self, agent_loop: AgentLoop) -> None:
+        agent_loop.messages[:] = restored_messages
+        agent_loop.compaction_count = restored_count
+        agent_loop.last_compaction_report = restored_report
+        self._initial_user_summary = restored_summary
+        if summary_was_derived and restored_summary is not None:
+            session.metadata["initial_user_summary"] = restored_summary
+
+    async def _auto_save(self, agent_loop: AgentLoop) -> bool:
         """Agent Loop 每轮完成后自动保存会话到磁盘。
 
         使用 fail-soft 策略：记录 debug 日志但不会阻断对话流程。
 
         Args:
             agent_loop: 刚完成一轮的 AgentLoop 实例。
+
+        Returns:
+            True 表示保存调用完成，False 表示保存过程中抛出异常。
         """
         try:
             manager = self._get_session_manager()
@@ -278,8 +322,18 @@ class ChatApp:
                 )
             self._sync_session_from_agent(self._current_session, agent_loop)
             manager.save(self._current_session)
+            # SessionManager.save 采用 fail-soft 语义，需回读确认实际已落盘。
+            saved_session = manager.load(self._current_session.id)
+            if saved_session != self._current_session:
+                logger.debug(
+                    "自动保存会话校验失败",
+                    session_id=self._current_session.id,
+                )
+                return False
+            return True
         except Exception as e:
             logger.debug("自动保存会话失败", error=str(e))
+            return False
 
     async def _handle_message(self, text: str) -> None:
         """处理一条用户消息。
@@ -303,15 +357,25 @@ class ChatApp:
 
         # 记录当前历史长度，用于异常回滚
         history_len = len(agent_loop.messages)
+        previous_summary = self._initial_user_summary
+        previous_session = self._current_session
+        previous_metadata_had_summary = (
+            previous_session is not None
+            and "initial_user_summary" in previous_session.metadata
+        )
+        previous_metadata_summary = (
+            previous_session.metadata.get("initial_user_summary")
+            if previous_session is not None
+            else None
+        )
         if self._initial_user_summary is None:
             self._initial_user_summary = summarize_user_input(text)
 
+        task_committed = False
         try:
             result = await agent_loop.run(text)
             if result is not None:
-                await self._auto_save(agent_loop)
-            elif self._current_session is None:
-                self._initial_user_summary = None
+                task_committed = await self._auto_save(agent_loop)
         except ProviderError as e:
             # 回滚本次用户消息
             del agent_loop.messages[history_len:]
@@ -320,6 +384,22 @@ class ChatApp:
             del agent_loop.messages[history_len:]
             self.renderer.show_error(f"发生未知错误：{e}")
             logger.debug("AgentLoop 处理异常", exc_info=True)
+        finally:
+            if not task_committed:
+                self._initial_user_summary = previous_summary
+                if self._current_session is previous_session:
+                    if previous_session is not None:
+                        if previous_metadata_had_summary:
+                            previous_session.metadata["initial_user_summary"] = (
+                                previous_metadata_summary
+                            )
+                        else:
+                            previous_session.metadata.pop(
+                                "initial_user_summary",
+                                None,
+                            )
+                elif previous_session is None:
+                    self._current_session = None
 
     async def _clear_and_new_session(self) -> None:
         """清空当前 AgentLoop 消息并创建新会话。
@@ -498,9 +578,9 @@ class ChatApp:
 
     async def _on_session_switched(self, session: Any) -> None:
         """/session switch 切换会话后的回调，更新 _current_session。"""
-        self._current_session = session
         if self._agent_loop is not None:
             self._restore_session_to_agent(session, self._agent_loop)
+        self._current_session = session
 
     async def _on_session_deleted(self, session_id: str) -> None:
         """/session delete 删除会话后的回调。若删除的是当前活跃会话，自动创建新会话。"""
