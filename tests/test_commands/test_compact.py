@@ -24,6 +24,7 @@ from minicode.config.models import AppConfig
 from minicode.providers.base import Message
 from minicode.providers.registry import MockProvider
 from minicode.tools import create_default_registry
+from minicode.utils.exceptions import ContextWindowExceededError
 
 
 def _compact_command() -> Any:
@@ -269,6 +270,105 @@ async def test_agent_loop_compact_context_preserves_state_when_unchanged(
         trigger=CompactionTrigger.MANUAL,
         focus=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_compact_context_preserves_state_when_strict_build_fails(
+    tmp_path: Path,
+) -> None:
+    """严格构建失败时手动压缩不得半提交任何 AgentLoop 状态。"""
+    loop = _make_loop(tmp_path)
+    original_message = Message(role="user", content="调用前历史")
+    loop.messages.append(original_message)
+    original_messages = loop.messages
+    original_snapshot = [
+        message.model_copy(deep=True) for message in loop.messages
+    ]
+    previous_usage = ContextUsageReport(
+        estimated_tokens=100,
+        max_input_tokens=24_000,
+        occupancy_ratio=100 / 24_000,
+        message_count=1,
+        system_tokens=50,
+        message_tokens=40,
+        tools_tokens=10,
+        unconsumed_tool_result_count=0,
+    )
+    previous_report = _compaction_report()
+    loop.last_context_report = previous_usage
+    loop.last_compaction_report = previous_report
+    loop.compaction_count = 4
+    loop.context_compactor.compact = AsyncMock(  # type: ignore[method-assign]
+        return_value=CompactionResult(
+            messages=[Message(role="user", content="候选摘要")],
+            report=_compaction_report(),
+            changed=True,
+        )
+    )
+    state_during_build: list[bool] = []
+
+    def fail_strict_build(*args: object, **kwargs: object) -> object:
+        state_during_build.extend(
+            [
+                loop.messages is original_messages,
+                loop.messages == original_snapshot,
+                loop.messages[0] is original_message,
+                loop.last_compaction_report is previous_report,
+                loop.compaction_count == 4,
+                loop.last_context_report is previous_usage,
+            ]
+        )
+        raise ContextWindowExceededError("候选上下文仍然超限")
+
+    with (
+        patch(
+            "minicode.agent.loop.build_strict_messages",
+            side_effect=fail_strict_build,
+        ),
+        pytest.raises(
+            ContextWindowExceededError,
+            match="候选上下文仍然超限",
+        ),
+    ):
+        await loop.compact_context("保留事务状态")
+
+    assert state_during_build and all(state_during_build)
+    assert loop.messages is original_messages
+    assert loop.messages == original_snapshot
+    assert loop.messages[0] is original_message
+    assert loop.last_compaction_report is previous_report
+    assert loop.compaction_count == 4
+    assert loop.last_context_report is previous_usage
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_compact_context_isolates_committed_state_from_result(
+    tmp_path: Path,
+) -> None:
+    """成功提交后返回结果的后续修改不得污染 AgentLoop 内部状态。"""
+    loop = _make_loop(tmp_path)
+    returned_result = CompactionResult(
+        messages=[Message(role="user", content="压缩摘要")],
+        report=_compaction_report(),
+        changed=True,
+    )
+    loop.context_compactor.compact = AsyncMock(  # type: ignore[method-assign]
+        return_value=returned_result
+    )
+
+    result = await loop.compact_context(None)
+
+    assert result is returned_result
+    assert result.report is not None
+    assert loop.last_compaction_report is not None
+    assert loop.messages[0] is not result.messages[0]
+    assert loop.last_compaction_report is not result.report
+
+    result.messages[0].content = "外部修改后的摘要"
+    result.report.before_tokens = 1
+
+    assert loop.messages[0].content == "压缩摘要"
+    assert loop.last_compaction_report.before_tokens == 12_345
 
 
 def test_agent_loop_get_context_usage_uses_current_inputs(tmp_path: Path) -> None:

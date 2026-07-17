@@ -425,6 +425,36 @@ class TestCommandRouting:
         assert should_exit is False
         chat_app._auto_save.assert_awaited_once_with(agent_loop)
 
+    async def test_history_changed_command_saves_when_renderer_raises(
+        self,
+        chat_app: ChatApp,
+    ) -> None:
+        """结果渲染失败时仍保存已修改历史并继续传播渲染异常。"""
+        command = MagicMock()
+        command.execute = AsyncMock(
+            return_value=CommandResult(
+                message="上下文已压缩。",
+                history_changed=True,
+            )
+        )
+        agent_loop = MagicMock(spec=AgentLoop)
+        chat_app._agent_loop = agent_loop
+        chat_app._auto_save = AsyncMock()  # type: ignore[method-assign]
+        chat_app.renderer.show_info = MagicMock(
+            side_effect=RuntimeError("渲染结果失败")
+        )
+
+        with (
+            patch(
+                "minicode.cli.app.CommandRegistry.find",
+                return_value=command,
+            ),
+            pytest.raises(RuntimeError, match="渲染结果失败"),
+        ):
+            await chat_app._handle_command("/compact")
+
+        chat_app._auto_save.assert_awaited_once_with(agent_loop)
+
     async def test_unchanged_command_does_not_auto_save(
         self,
         chat_app: ChatApp,

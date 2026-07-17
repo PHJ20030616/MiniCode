@@ -392,15 +392,17 @@ class ChatApp:
             self.renderer.show_error(f"命令执行失败：{e}")
             return False
 
-        # 处理结果
-        if result.message:
-            if result.success:
-                self.renderer.show_info(result.message)
-            else:
-                self.renderer.show_error(result.message)
-
-        if result.history_changed and self._agent_loop is not None:
-            await self._auto_save(self._agent_loop)
+        agent_loop = self._agent_loop
+        try:
+            # 历史已由命令修改时，即使结果渲染失败也必须持久化。
+            if result.message:
+                if result.success:
+                    self.renderer.show_info(result.message)
+                else:
+                    self.renderer.show_error(result.message)
+        finally:
+            if result.history_changed and agent_loop is not None:
+                await self._auto_save(agent_loop)
 
         return result.should_exit
 

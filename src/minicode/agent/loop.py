@@ -278,17 +278,26 @@ class AgentLoop:
         if not result.changed:
             return result
 
-        # 压缩器已完成候选校验；保留列表对象，避免破坏外部状态引用。
-        self.messages.clear()
-        self.messages.extend(result.messages)
-        self.last_compaction_report = result.report
-        self.compaction_count += 1
+        # 先在独立候选上完成严格校验，避免失败时半提交 Agent 状态。
+        candidate_messages = [
+            message.model_copy(deep=True) for message in result.messages
+        ]
         strict = build_strict_messages(
-            self.messages,
+            candidate_messages,
             self.system_prompt,
             tools_schema,
             self.config.agent.context,
         )
+
+        # 严格校验成功后再一次性提交，并隔离压缩器返回的可变对象。
+        self.messages.clear()
+        self.messages.extend(candidate_messages)
+        self.last_compaction_report = (
+            result.report.model_copy(deep=True)
+            if result.report is not None
+            else None
+        )
+        self.compaction_count += 1
         self.last_context_report = strict.report
         return result
 
