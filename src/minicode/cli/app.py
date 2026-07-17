@@ -339,7 +339,7 @@ class ChatApp:
         """处理一条用户消息。
 
         确认 AgentLoop 可用后执行 ReAct 循环。
-        任何异常都会回滚本次消息，不污染对话历史。
+        AgentLoop 负责本轮事务回滚，ChatApp 只处理展示与会话保存。
 
         Args:
             text: 用户输入文本。
@@ -355,8 +355,6 @@ class ChatApp:
             logger.debug("获取 AgentLoop 异常", exc_info=True)
             return
 
-        # 记录当前历史长度，用于异常回滚
-        history_len = len(agent_loop.messages)
         previous_summary = self._initial_user_summary
         previous_session = self._current_session
         previous_metadata_had_summary = (
@@ -379,11 +377,8 @@ class ChatApp:
                 history_retained = True
                 await self._auto_save(agent_loop)
         except ProviderError as e:
-            # 回滚本次用户消息
-            del agent_loop.messages[history_len:]
             self.renderer.show_error(str(e))
         except Exception as e:
-            del agent_loop.messages[history_len:]
             self.renderer.show_error(f"发生未知错误：{e}")
             logger.debug("AgentLoop 处理异常", exc_info=True)
         finally:
