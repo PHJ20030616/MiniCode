@@ -48,7 +48,11 @@ from minicode.providers.base import (
 from minicode.tools import create_default_registry
 from minicode.tools.base import ToolResult
 from minicode.tools.registry import ToolRegistry
-from minicode.utils.exceptions import ProviderError
+from minicode.utils.exceptions import (
+    ContextCompactionError,
+    ContextWindowExceededError,
+    ProviderError,
+)
 
 # ─── Mock Provider ─────────────────────────────────────────────────
 
@@ -164,12 +168,13 @@ class MagicRenderer:
     def __init__(self) -> None:
         self.console = MagicConsole()
         self.info_messages: list[str] = []
+        self.error_messages: list[str] = []
 
     def show_info(self, message: str) -> None:
         self.info_messages.append(message)
 
     def show_error(self, message: str) -> None:
-        pass
+        self.error_messages.append(message)
 
     def show_usage(self, usage: UsageInfo) -> None:
         pass
@@ -240,8 +245,8 @@ def _compaction_report(
     return CompactionReport(
         trigger=trigger,
         created_at=datetime.now(UTC),
-        before_tokens=1200,
-        after_tokens=320,
+        before_tokens=12_345,
+        after_tokens=6_789,
         before_message_count=6,
         after_message_count=2,
         summarized_message_count=4,
@@ -277,7 +282,7 @@ def test_format_compaction_report_uses_chinese_label(
     """压缩提示展示触发方式、词元变化和工具结果清理数。"""
     text = compaction.format_compaction_report(_compaction_report(trigger=trigger))
 
-    assert text == f"上下文{label}压缩：1200 → 320 tokens，清理工具结果 2 条。"
+    assert text == f"上下文{label}压缩：12,345 → 6,789 词元，清理工具结果 2 条。"
 
 
 @pytest.mark.asyncio
@@ -388,12 +393,105 @@ async def test_react_auto_compaction_commits_summary_report_and_count(
 
 
 @pytest.mark.asyncio
+async def test_planning_preflight_context_error_rolls_back_current_turn(
+    tmp_path: Path,
+    app_config: AppConfig,
+) -> None:
+    """规划预检失败时显示中文错误，并回滚本轮用户消息。"""
+
+    class FailingCompactor:
+        async def compact(
+            self,
+            messages: list[Message],
+            system_prompt: str,
+            tools_schema: list[dict],
+            trigger: CompactionTrigger,
+            focus: str | None = None,
+        ) -> CompactionResult:
+            raise ContextCompactionError("摘要生成失败")
+
+    config = app_config.model_copy(deep=True)
+    config.agent.planning.enabled = True
+    config.agent.context.compaction = _auto_compaction_config()
+    provider = MockStepProvider([])
+    renderer = MagicRenderer()
+    loop = AgentLoop(
+        provider=provider,
+        tool_registry=create_default_registry(),
+        renderer=renderer,  # type: ignore[arg-type]
+        config=config,
+        workspace_root=tmp_path,
+    )
+    loop.messages.append(Message(role="assistant", content="此前回复"))
+    previous_messages = list(loop.messages)
+    loop.context_compactor = FailingCompactor()  # type: ignore[assignment]
+
+    result = await loop.run("请继续规划")
+
+    assert result is None
+    assert loop.messages == previous_messages
+    assert loop.last_execution_plan is None
+    assert provider.call_count == 0
+    assert renderer.error_messages
+    assert "规划" in renderer.error_messages[-1]
+    assert "上下文" in renderer.error_messages[-1]
+    assert "摘要生成失败" in renderer.error_messages[-1]
+
+
+@pytest.mark.asyncio
+async def test_react_preflight_context_error_rolls_back_current_turn(
+    tmp_path: Path,
+    app_config: AppConfig,
+) -> None:
+    """ReAct 预检失败时显示中文错误，并回滚本轮用户消息。"""
+
+    class FailingCompactor:
+        async def compact(
+            self,
+            messages: list[Message],
+            system_prompt: str,
+            tools_schema: list[dict],
+            trigger: CompactionTrigger,
+            focus: str | None = None,
+        ) -> CompactionResult:
+            raise ContextWindowExceededError("上下文仍然超出窗口")
+
+    config = app_config.model_copy(deep=True)
+    config.agent.context.compaction = _auto_compaction_config()
+    provider = MockStepProvider([])
+    renderer = MagicRenderer()
+    loop = AgentLoop(
+        provider=provider,
+        tool_registry=create_default_registry(),
+        renderer=renderer,  # type: ignore[arg-type]
+        config=config,
+        workspace_root=tmp_path,
+    )
+    loop.messages.append(Message(role="assistant", content="此前回复"))
+    previous_messages = list(loop.messages)
+    loop.context_compactor = FailingCompactor()  # type: ignore[assignment]
+
+    result = await loop.run("请继续执行")
+
+    assert result is None
+    assert loop.messages == previous_messages
+    assert provider.call_count == 0
+    assert renderer.error_messages
+    assert "上下文" in renderer.error_messages[-1]
+    assert "上下文仍然超出窗口" in renderer.error_messages[-1]
+
+
+@pytest.mark.asyncio
 async def test_planning_preflight_runs_before_planner_without_tools(
     tmp_path: Path,
     app_config: AppConfig,
 ) -> None:
     """规划 Provider 调用前先用规划提示词和空工具 schema 执行预检。"""
     events: list[tuple[str, object, object]] = []
+    reports = [
+        _compaction_report().model_copy(update={"before_tokens": 12_345}),
+        _compaction_report().model_copy(update={"before_tokens": 23_456}),
+    ]
 
     class OrderedProvider(MockStepProvider):
         async def chat(
@@ -408,6 +506,9 @@ async def test_planning_preflight_runs_before_planner_without_tools(
                 yield chunk
 
     class OrderedCompactor:
+        def __init__(self) -> None:
+            self.call_count = 0
+
         async def compact(
             self,
             messages: list[Message],
@@ -417,9 +518,12 @@ async def test_planning_preflight_runs_before_planner_without_tools(
             focus: str | None = None,
         ) -> CompactionResult:
             events.append(("compact", tools_schema, system_prompt))
+            report = reports[self.call_count]
+            self.call_count += 1
             return CompactionResult(
                 messages=[message.model_copy(deep=True) for message in messages],
-                changed=False,
+                report=report,
+                changed=True,
             )
 
     config = app_config.model_copy(deep=True)
@@ -440,21 +544,38 @@ async def test_planning_preflight_runs_before_planner_without_tools(
             ],
         ]
     )
+    renderer = MagicRenderer()
+    compactor = OrderedCompactor()
     loop = AgentLoop(
         provider=provider,
         tool_registry=create_default_registry(),
-        renderer=MagicRenderer(),  # type: ignore[arg-type]
+        renderer=renderer,  # type: ignore[arg-type]
         config=config,
         workspace_root=tmp_path,
     )
-    loop.context_compactor = OrderedCompactor()  # type: ignore[assignment]
+    loop.context_compactor = compactor  # type: ignore[assignment]
 
     response = await loop.run("请完成任务")
 
     assert response == "完成"
+    assert [event[0] for event in events] == [
+        "compact",
+        "provider",
+        "compact",
+        "provider",
+    ]
     assert events[0] == ("compact", [], PLANNING_SYSTEM_PROMPT)
-    assert events[1][0] == "provider"
     assert events[1][1] is None
+    assert events[2][1] == loop._get_tools_schema()
+    assert events[2][2] == loop.system_prompt
+    assert events[3][1] == loop._get_tools_schema()
+    assert compactor.call_count == 2
+    assert loop.compaction_count == 2
+    assert loop.last_compaction_report == reports[1]
+    assert loop.last_context_report is not None
+    assert renderer.info_messages[-2:] == [
+        compaction.format_compaction_report(report) for report in reports
+    ]
 
 
 # ─── Test 1: 无工具直接回答 ────────────────────────────────────────

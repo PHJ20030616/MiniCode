@@ -123,7 +123,7 @@ async def test_task_planner_forwards_prebuilt_messages_without_tools() -> None:
     assert call["tools"] is None
     assert call["stream"] is True
     assert call["max_tokens"] == 512
-    assert call["messages"] is api_messages
+    assert call["messages"] == api_messages
 
 
 @pytest.mark.asyncio

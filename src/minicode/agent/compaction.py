@@ -70,7 +70,7 @@ def format_compaction_report(report: CompactionReport) -> str:
     )
     return (
         f"上下文{trigger_label}压缩："
-        f"{report.before_tokens} → {report.after_tokens} tokens，"
+        f"{report.before_tokens:,} → {report.after_tokens:,} 词元，"
         f"清理工具结果 {report.cleared_tool_result_count} 条。"
     )
 

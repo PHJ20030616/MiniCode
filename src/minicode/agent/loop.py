@@ -47,7 +47,11 @@ from minicode.providers.base import (
     ToolMessage,
     UsageInfo,
 )
-from minicode.utils.exceptions import ProviderError
+from minicode.utils.exceptions import (
+    ContextCompactionError,
+    ContextWindowExceededError,
+    ProviderError,
+)
 from minicode.utils.log import get_logger
 
 if TYPE_CHECKING:
@@ -279,6 +283,12 @@ class AgentLoop:
         try:
             if force_plan or self.config.agent.planning.enabled:
                 await self._create_execution_plan(user_input)
+        except (ContextCompactionError, ContextWindowExceededError) as e:
+            logger.debug("规划上下文准备失败", error=str(e))
+            self.renderer.show_error(f"规划上下文准备失败：{e}")
+            del self.messages[history_len:]
+            self.last_execution_plan = None
+            return None
         except ProviderError as e:
             logger.debug("规划阶段失败", error=str(e))
             self.renderer.show_error(f"计划生成失败：{e}")
@@ -291,11 +301,17 @@ class AgentLoop:
         for round_num in range(1, self.config.agent.max_rounds + 1):
             logger.debug("ReAct 轮次", round=round_num)
 
-            tools_schema = self._get_tools_schema()
-            api_messages = await self._prepare_main_call(
-                self.system_prompt,
-                tools_schema,
-            )
+            try:
+                tools_schema = self._get_tools_schema()
+                api_messages = await self._prepare_main_call(
+                    self.system_prompt,
+                    tools_schema,
+                )
+            except (ContextCompactionError, ContextWindowExceededError) as e:
+                logger.debug("ReAct 上下文准备失败", round=round_num, error=str(e))
+                self.renderer.show_error(f"上下文准备失败：{e}")
+                del self.messages[history_len:]
+                return None
 
             # 调用 Provider
             try:

@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from minicode.agent.context_models import ContextUsageReport
 from minicode.commands.base import CommandContext
 from minicode.commands.context_cmd import ContextCommand
 
@@ -72,3 +73,40 @@ class TestContextCommand:
         assert "2000" in msg
         assert "4" in msg
         assert "2" in msg
+
+    @pytest.mark.asyncio
+    async def test_with_usage_report_shows_current_context_breakdown(
+        self,
+        cmd: ContextCommand,
+    ) -> None:
+        """新用量报告显示当前消息、预算、占用率和词元分项。"""
+        report = ContextUsageReport(
+            estimated_tokens=12_345,
+            max_input_tokens=24_000,
+            occupancy_ratio=0.514375,
+            message_count=7,
+            system_tokens=1_000,
+            message_tokens=11_000,
+            tools_tokens=345,
+            unconsumed_tool_result_count=0,
+        )
+        ctx = MagicMock(spec=CommandContext)
+        ctx.agent_loop = MagicMock()
+        ctx.agent_loop.last_context_report = report
+
+        result = await cmd.execute("", ctx)
+
+        assert result.success
+        msg = result.message or ""
+        assert "当前消息数" in msg
+        assert "7" in msg
+        assert "估算词元" in msg
+        assert "12,345 / 24,000" in msg
+        assert "占用率" in msg
+        assert "51.4%" in msg
+        assert "系统提示词元" in msg
+        assert "1,000" in msg
+        assert "消息词元" in msg
+        assert "11,000" in msg
+        assert "工具定义词元" in msg
+        assert "345" in msg
