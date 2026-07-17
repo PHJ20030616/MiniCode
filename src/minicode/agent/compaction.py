@@ -109,15 +109,21 @@ async def _collect_summary(
     stream = await response if inspect.isawaitable(response) else response
 
     parts: list[str] = []
+    received_done = False
     async for chunk in stream:
         if chunk.type == "error":
             detail = f"：{chunk.text.strip()}" if chunk.text and chunk.text.strip() else ""
             raise ContextCompactionError(f"摘要 Provider 返回错误{detail}")
+        if chunk.type == "tool_call_delta":
+            raise ContextCompactionError("摘要 Provider 返回了不允许的工具调用")
         if chunk.type == "done":
+            received_done = True
             break
         if chunk.type == "text_delta" and chunk.text:
             parts.append(chunk.text)
 
+    if not received_done:
+        raise ContextCompactionError("摘要 Provider 未返回完成标记")
     summary = "".join(parts).strip()
     if not summary:
         raise ContextCompactionError("摘要 Provider 未返回有效文本")
@@ -205,6 +211,31 @@ def select_protected_suffix_start(messages: list[Message], recent_budget: int) -
     return protected_start
 
 
+def _is_cleanup_placeholder(message: ToolMessage) -> bool:
+    """严格识别本模块生成的已消费工具结果清理占位符。"""
+    if not isinstance(message.content, str) or message.name is None:
+        return False
+
+    prefix = (
+        f"[上下文压缩：{message.name} 的已消费结果已清除，原始内容约 "
+    )
+    suffix = " 字符；必要时请重新读取。]"
+    if not message.content.startswith(prefix) or not message.content.endswith(suffix):
+        return False
+
+    char_count = message.content[len(prefix) : -len(suffix)]
+    if char_count == "0":
+        return True
+
+    groups = char_count.split(",")
+    return (
+        1 <= len(groups[0]) <= 3
+        and groups[0].isdigit()
+        and not groups[0].startswith("0")
+        and all(len(group) == 3 and group.isdigit() for group in groups[1:])
+    )
+
+
 def cleanup_consumed_tool_results(
     messages: list[Message],
     cleanup_tools: Collection[str],
@@ -220,6 +251,7 @@ def cleanup_consumed_tool_results(
             and cleaned.name in cleanup_tools
             and cleaned.consumed_by_main_model
             and isinstance(cleaned.content, str)
+            and not _is_cleanup_placeholder(cleaned)
         ):
             char_count = len(cleaned.content)
             cleaned.content = (
@@ -298,6 +330,13 @@ class ContextCompactor:
         focus: str | None = None,
     ) -> CompactionResult:
         """生成压缩候选；完整校验通过前不修改或提交原历史。"""
+        for index, message in enumerate(messages):
+            if message.kind == "compact_summary" and message.role != "user":
+                raise ContextCompactionError(
+                    "上下文压缩历史中的 compact_summary 标记只能用于 "
+                    f"role='user'，索引 {index} 的消息角色无效，原历史未修改。"
+                )
+
         max_input_tokens = self._context_config.max_input_tokens
         compaction_config = self._context_config.compaction
         before = estimate_context_usage(
@@ -390,7 +429,12 @@ class ContextCompactor:
             )
         candidate.extend(cleaned_suffix)
 
-        validate_tool_protocol(candidate)
+        try:
+            validate_tool_protocol(candidate)
+        except ValueError as error:
+            raise ContextCompactionError(
+                f"上下文压缩候选的工具协议校验失败：{error}原历史未修改。"
+            ) from error
         after = estimate_context_usage(
             candidate,
             system_prompt,

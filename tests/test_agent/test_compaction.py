@@ -242,6 +242,36 @@ async def test_collect_summary_accepts_both_provider_return_shapes(
     assert provider.calls[0].max_tokens == 32
 
 
+async def test_collect_summary_rejects_stream_without_done() -> None:
+    provider = DeterministicSummaryProvider(
+        [[StreamChunk(type="text_delta", text="未完成摘要")]]
+    )
+
+    with pytest.raises(exceptions.ContextCompactionError, match="完成标记"):
+        await compaction._collect_summary(
+            provider,
+            [Message(role="system", content="摘要系统提示")],
+            max_tokens=32,
+        )
+
+
+async def test_collect_summary_rejects_tool_call_delta_immediately() -> None:
+    provider = DeterministicSummaryProvider(
+        [[
+            StreamChunk(type="text_delta", text="错误摘要"),
+            StreamChunk(type="tool_call_delta"),
+            StreamChunk(type="done"),
+        ]]
+    )
+
+    with pytest.raises(exceptions.ContextCompactionError, match="工具调用"):
+        await compaction._collect_summary(
+            provider,
+            [Message(role="system", content="摘要系统提示")],
+            max_tokens=32,
+        )
+
+
 async def test_manual_compaction_summarizes_prefix_and_keeps_latest_suffix() -> None:
     summary = "## 当前任务与最终目标\n完成上下文压缩。"
     provider = DeterministicSummaryProvider([_summary_chunks(summary)])
@@ -434,9 +464,49 @@ async def test_recompaction_rolls_existing_summary_into_single_new_summary() -> 
     summaries = [message for message in result.messages if message.kind == "compact_summary"]
     assert len(summaries) == 1
     assert summaries[0] is result.messages[0]
+    assert summaries[0].role == "user"
     assert summaries[0].content != old_summary_content
     assert result.report is not None
     assert result.report.summarized_message_count == 2
+
+
+async def test_compaction_rejects_tool_message_marked_as_summary_before_grouping() -> None:
+    provider = DeterministicSummaryProvider(
+        [_summary_chunks("## 当前任务与最终目标\n不应生成摘要。")]
+    )
+    messages = [
+        _assistant_with_tools(("call_read", "read_file")),
+        ToolMessage(
+            content="工具结果",
+            tool_call_id="call_read",
+            name="read_file",
+            kind="compact_summary",
+            consumed_by_main_model=True,
+        ),
+    ]
+    original_snapshot = _message_snapshot(messages)
+    original_tool_calls = messages[0].tool_calls
+    assert original_tool_calls is not None
+    original_tool_call = original_tool_calls[0]
+
+    with pytest.raises(
+        exceptions.ContextCompactionError,
+        match="compact_summary.*user",
+    ):
+        await compaction.ContextCompactor(
+            provider,
+            _context_config(max_input_tokens=10000),
+        ).compact(
+            messages,
+            "主系统提示",
+            [],
+            CompactionTrigger.MANUAL,
+        )
+
+    assert provider.calls == []
+    assert _message_snapshot(messages) == original_snapshot
+    assert messages[0].tool_calls is original_tool_calls
+    assert messages[0].tool_calls[0] is original_tool_call
 
 
 async def test_no_prefix_or_cleanup_returns_unchanged_deep_copy() -> None:
@@ -480,6 +550,53 @@ async def test_no_prefix_or_cleanup_returns_unchanged_deep_copy() -> None:
     assert result.messages[0].tool_calls[0] is not original_tool_calls[0]
 
 
+async def test_repeated_cleanup_only_compaction_is_idempotent() -> None:
+    provider = DeterministicSummaryProvider([])
+    messages = [
+        _assistant_with_tools(("call_read", "read_file")),
+        ToolMessage(
+            content="原始工具正文" * 200,
+            tool_call_id="call_read",
+            name="read_file",
+            consumed_by_main_model=True,
+        ),
+        Message(role="user", content="继续"),
+    ]
+    compactor = compaction.ContextCompactor(
+        provider,
+        _context_config(max_input_tokens=10000),
+    )
+
+    first = await compactor.compact(
+        messages,
+        "主系统提示",
+        [],
+        CompactionTrigger.MANUAL,
+    )
+
+    assert first.changed is True
+    assert first.report is not None
+    assert first.report.cleared_tool_result_count == 1
+    first_placeholder = first.messages[1].content
+    first_snapshot = _message_snapshot(first.messages)
+
+    second = await compactor.compact(
+        first.messages,
+        "主系统提示",
+        [],
+        CompactionTrigger.MANUAL,
+    )
+
+    assert second.changed is False
+    assert second.report is None
+    assert second.messages[1].content == first_placeholder
+    assert _message_snapshot(second.messages) == first_snapshot
+    assert _message_snapshot(first.messages) == first_snapshot
+    assert second.messages is not first.messages
+    assert second.messages[1] is not first.messages[1]
+    assert provider.calls == []
+
+
 async def test_oversized_candidate_raises_without_mutating_input() -> None:
     provider = DeterministicSummaryProvider([_summary_chunks("超长摘要" * 1000)])
     messages = [
@@ -503,6 +620,40 @@ async def test_oversized_candidate_raises_without_mutating_input() -> None:
         )
 
     assert _message_snapshot(messages) == original_snapshot
+
+
+async def test_compaction_wraps_candidate_tool_protocol_error() -> None:
+    provider = DeterministicSummaryProvider(
+        [_summary_chunks("## 当前任务与最终目标\n保留协议完整性。")]
+    )
+    messages = [
+        Message(role="user", content="旧历史" + "X" * 2000),
+        ToolMessage(
+            content="孤立且未消费的结果",
+            tool_call_id="call_orphan",
+            name="read_file",
+        ),
+    ]
+    original_snapshot = _message_snapshot(messages)
+
+    with pytest.raises(
+        exceptions.ContextCompactionError,
+        match="工具协议校验失败",
+    ) as exc_info:
+        await compaction.ContextCompactor(
+            provider,
+            _context_config(max_input_tokens=500),
+        ).compact(
+            messages,
+            "主系统提示",
+            [],
+            CompactionTrigger.AUTOMATIC,
+        )
+
+    assert isinstance(exc_info.value.__cause__, ValueError)
+    assert _message_snapshot(messages) == original_snapshot
+    assert isinstance(messages[1], ToolMessage)
+    assert messages[1].consumed_by_main_model is False
 
 
 def test_atomic_message_group_is_frozen() -> None:
