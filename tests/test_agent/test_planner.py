@@ -6,7 +6,6 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from minicode.agent.context_models import ContextConfig
 from minicode.agent.planner import TaskPlanner, parse_execution_plan
 from minicode.agent.planning_models import PlanningConfig
 from minicode.providers.base import BaseProvider, Message, StreamChunk
@@ -90,8 +89,8 @@ def test_parse_execution_plan_falls_back_to_text_lines() -> None:
 
 
 @pytest.mark.asyncio
-async def test_task_planner_calls_provider_without_tools() -> None:
-    """规划阶段不允许调用工具，只生成计划文本。"""
+async def test_task_planner_forwards_prebuilt_messages_without_tools() -> None:
+    """规划器原样转发预构建消息，并禁用工具。"""
     provider = RecordingProvider(
         [
             StreamChunk(
@@ -104,12 +103,15 @@ async def test_task_planner_calls_provider_without_tools() -> None:
     planner = TaskPlanner(
         provider=provider,
         planning_config=PlanningConfig(enabled=True, max_steps=4, max_tokens=1024),
-        context_config=ContextConfig(),
         stream=True,
     )
+    api_messages = [
+        Message(role="system", content="预构建规划提示词"),
+        Message(role="user", content="请修复问题"),
+    ]
 
     plan = await planner.create_plan(
-        messages=[Message(role="user", content="请修复问题")],
+        api_messages=api_messages,
         user_input="请修复问题",
         max_tokens=512,
     )
@@ -121,8 +123,7 @@ async def test_task_planner_calls_provider_without_tools() -> None:
     assert call["tools"] is None
     assert call["stream"] is True
     assert call["max_tokens"] == 512
-    assert isinstance(call["messages"], list)
-    assert call["messages"][0].role == "system"  # type: ignore[index]
+    assert call["messages"] is api_messages
 
 
 @pytest.mark.asyncio
@@ -132,13 +133,15 @@ async def test_task_planner_raises_provider_error_from_stream() -> None:
     planner = TaskPlanner(
         provider=provider,
         planning_config=PlanningConfig(enabled=True),
-        context_config=ContextConfig(),
         stream=True,
     )
 
     with pytest.raises(ProviderError, match="规划失败"):
         await planner.create_plan(
-            messages=[Message(role="user", content="请修复问题")],
+            api_messages=[
+                Message(role="system", content="预构建规划提示词"),
+                Message(role="user", content="请修复问题"),
+            ],
             user_input="请修复问题",
             max_tokens=None,
         )

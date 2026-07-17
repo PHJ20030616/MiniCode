@@ -11,8 +11,6 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any, cast
 
-from minicode.agent.context import build_messages
-from minicode.agent.context_models import ContextConfig
 from minicode.agent.planning_models import ExecutionPlan, PlanningConfig, PlanStep
 from minicode.providers.base import BaseProvider, Message, StreamChunk
 from minicode.utils.exceptions import ProviderError
@@ -155,33 +153,26 @@ class TaskPlanner:
         self,
         provider: BaseProvider,
         planning_config: PlanningConfig,
-        context_config: ContextConfig,
         stream: bool,
     ) -> None:
         self.provider = provider
         self.planning_config = planning_config
-        self.context_config = context_config
         self.stream = stream
 
     async def create_plan(
         self,
-        messages: list[Message],
+        api_messages: list[Message],
         user_input: str,
         max_tokens: int | None,
     ) -> ExecutionPlan:
         """调用模型生成执行计划。"""
-        context_result = build_messages(
-            messages=messages,
-            system_prompt=PLANNING_SYSTEM_PROMPT,
-            context_config=self.context_config,
-        )
         planning_tokens = self.planning_config.max_tokens
         if max_tokens is not None:
             planning_tokens = min(planning_tokens, max_tokens)
 
         # 规划阶段必须禁用工具，避免模型在尚未制定计划时产生副作用。
         stream = self.provider.chat(
-            messages=context_result.messages,
+            messages=api_messages,
             tools=None,
             stream=self.stream,
             max_tokens=planning_tokens,

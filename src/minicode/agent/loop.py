@@ -27,9 +27,14 @@ from typing import TYPE_CHECKING
 from rich.markdown import Markdown
 from rich.text import Text
 
-from minicode.agent.context import build_messages
-from minicode.agent.context_models import ContextBuildReport
-from minicode.agent.planner import TaskPlanner
+from minicode.agent.compaction import ContextCompactor, format_compaction_report
+from minicode.agent.context import build_strict_messages, estimate_context_usage
+from minicode.agent.context_models import (
+    CompactionReport,
+    CompactionTrigger,
+    ContextUsageReport,
+)
+from minicode.agent.planner import PLANNING_SYSTEM_PROMPT, TaskPlanner
 from minicode.agent.planning_models import ExecutionPlan
 from minicode.agent.system_prompt import build_system_prompt
 from minicode.memory.manager import MemoryManager
@@ -128,7 +133,13 @@ class AgentLoop:
         self.permission_store = permission_store
         self.permission_confirmer = permission_confirmer
         self.messages: list[Message] = []
-        self.last_context_report: ContextBuildReport | None = None
+        self.context_compactor = ContextCompactor(
+            provider=self.provider,
+            context_config=self.config.agent.context,
+        )
+        self.last_context_report: ContextUsageReport | None = None
+        self.last_compaction_report: CompactionReport | None = None
+        self.compaction_count = 0
         self.last_execution_plan: ExecutionPlan | None = None
         self._subagents_started_this_run = 0
         self._memory_enabled = config.memory.enabled
@@ -147,6 +158,61 @@ class AgentLoop:
             memory_content=memory_content,
             memory_enabled=self._memory_enabled,
         )
+
+    def _get_tools_schema(self) -> list[dict]:
+        """获取主 Agent 工具 schema，并按记忆配置过滤 remember。"""
+        tools_schema = self.tool_registry.get_tools_schema()
+        if self._memory_enabled:
+            return tools_schema
+        return [
+            tool
+            for tool in tools_schema
+            if tool.get("function", {}).get("name") != "remember"
+        ]
+
+    async def _prepare_main_call(
+        self,
+        system_prompt: str,
+        tools_schema: list[dict],
+    ) -> list[Message]:
+        """在主模型调用前按占用率自动压缩，并构建严格上下文。"""
+        context_config = self.config.agent.context
+        usage = estimate_context_usage(
+            self.messages,
+            system_prompt,
+            tools_schema,
+            context_config.max_input_tokens,
+        )
+        compaction_config = context_config.compaction
+        if (
+            compaction_config.auto_enabled
+            and usage.occupancy_ratio >= compaction_config.trigger_ratio
+        ):
+            result = await self.context_compactor.compact(
+                self.messages,
+                system_prompt,
+                tools_schema,
+                trigger=CompactionTrigger.AUTOMATIC,
+            )
+            if result.changed:
+                # 压缩器先完成候选构建与校验；这里只原子替换已确认的结果。
+                self.messages.clear()
+                self.messages.extend(result.messages)
+                self.last_compaction_report = result.report
+                self.compaction_count += 1
+                if result.report is not None:
+                    self.renderer.show_info(
+                        format_compaction_report(result.report)
+                    )
+
+        strict = build_strict_messages(
+            self.messages,
+            system_prompt,
+            tools_schema,
+            context_config,
+        )
+        self.last_context_report = strict.report
+        return strict.messages
 
     def reload_memory(self) -> None:
         """重新加载记忆并刷新系统提示词。
@@ -175,14 +241,17 @@ class AgentLoop:
         消息进入历史，使后续 ReAct 阶段可以基于该计划继续行动。
         """
         self.renderer.show_info("正在制定执行计划...")
+        api_messages = await self._prepare_main_call(
+            PLANNING_SYSTEM_PROMPT,
+            [],
+        )
         planner = TaskPlanner(
             provider=self.provider,
             planning_config=self.config.agent.planning,
-            context_config=self.config.agent.context,
             stream=self.config.agent.stream,
         )
         plan = await planner.create_plan(
-            messages=self.messages,
+            api_messages=api_messages,
             user_input=user_input,
             max_tokens=self.config.max_tokens,
         )
@@ -222,24 +291,13 @@ class AgentLoop:
         for round_num in range(1, self.config.agent.max_rounds + 1):
             logger.debug("ReAct 轮次", round=round_num)
 
-            # 构建 API 消息（system + history），含上下文预算控制
-            context_result = build_messages(
-                self.messages,
+            tools_schema = self._get_tools_schema()
+            api_messages = await self._prepare_main_call(
                 self.system_prompt,
-                self.config.agent.context,
+                tools_schema,
             )
-            self.last_context_report = context_result.report
-            api_messages = context_result.messages
 
             # 调用 Provider
-            tools_schema = self.tool_registry.get_tools_schema()
-            # memory 禁用时从 tools schema 中过滤掉 remember
-            if not self._memory_enabled:
-                tools_schema = [
-                    t for t in tools_schema
-                    if t.get("function", {}).get("name") != "remember"
-                ]
-
             try:
                 stream = self.provider.chat(
                     messages=api_messages,
@@ -602,9 +660,9 @@ class AgentLoop:
                                 )
                             else:
                                 # 有 confirmer → 询问用户（注意：这会在并发中阻塞）
-                                result = await self.permission_confirmer.confirm(decision)
+                                confirmation = await self.permission_confirmer.confirm(decision)
 
-                                if result.action == "deny":
+                                if confirmation.action == "deny":
                                     logger.debug("用户拒绝工具执行", tool=name)
                                     return (
                                         index,
@@ -615,23 +673,25 @@ class AgentLoop:
                                         ),
                                     )
 
-                                if result.action == "always_allow":
-                                    # 添加到 store
-                                    if self.permission_store is not None and decision.target_paths:
-                                        try:
-                                            rel = decision.target_paths[0].relative_to(
-                                                self.workspace_root
-                                            )
-                                            pattern = rel.as_posix()
-                                            self.permission_store.add_rule(name, pattern)
-                                        except ValueError:
-                                            pass
+                                if (
+                                    confirmation.action == "always_allow"
+                                    and self.permission_store is not None
+                                    and decision.target_paths
+                                ):
+                                    try:
+                                        rel = decision.target_paths[0].relative_to(
+                                            self.workspace_root
+                                        )
+                                        pattern = rel.as_posix()
+                                        self.permission_store.add_rule(name, pattern)
+                                    except ValueError:
+                                        pass
                                 # allow 或 always_allow 都继续执行
 
                 # 执行工具
                 logger.debug("并发执行读工具", tool=name, args=args)
                 try:
-                    result = await self.tool_registry.execute_tool(
+                    tool_result = await self.tool_registry.execute_tool(
                         name=name,
                         args=args,
                         workspace_root=self.workspace_root,
@@ -648,14 +708,14 @@ class AgentLoop:
                     )
 
                 # 构造 ToolMessage
-                if not result.success:
-                    error_detail = result.error or result.output
+                if not tool_result.success:
+                    error_detail = tool_result.error or tool_result.output
                     logger.debug("工具执行失败", tool=name, error=error_detail[:100])
 
                 return (
                     index,
                     ToolMessage(
-                        content=result.output,
+                        content=tool_result.output,
                         tool_call_id=tc.id,
                         name=name,
                     ),
@@ -681,24 +741,25 @@ class AgentLoop:
             self.messages.append(tool_msg)
 
         # 显示执行完成信息
-        success_count = sum(
-            1
-            for _, msg in results_sorted
-            if not msg.content.startswith("参数解析错误")
-            and not msg.content.startswith("权限拒绝")
-            and not msg.content.startswith("工具执行失败")
-        )
+        success_count = 0
+        for _, message in results_sorted:
+            content = message.content or ""
+            if not content.startswith(
+                ("参数解析错误", "权限拒绝", "工具执行失败")
+            ):
+                success_count += 1
         if len(tool_calls) > 1:
             self.renderer.show_info(f"读工具执行完成：{success_count}/{len(tool_calls)} 成功")
         else:
+            result_content = results_sorted[0][1].content or ""
             if success_count == 1:
                 self.renderer.show_info(
-                    f"工具执行成功（{len(results_sorted[0][1].content)} 字符）"
+                    f"工具执行成功（{len(result_content)} 字符）"
                 )
             else:
                 self.renderer.show_error(
                     f"工具执行失败：{tool_calls[0].function.name} — "
-                    f"{results_sorted[0][1].content[:200]}"
+                    f"{result_content[:200]}"
                 )
 
     async def _execute_subagent_batch(self, tool_calls: list[ToolCall]) -> None:

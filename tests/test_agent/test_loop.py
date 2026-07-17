@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
 from time import perf_counter
@@ -22,7 +23,15 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.text import Text
 
+import minicode.agent.compaction as compaction
+from minicode.agent.context_models import (
+    CompactionConfig,
+    CompactionReport,
+    CompactionResult,
+    CompactionTrigger,
+)
 from minicode.agent.loop import AgentLoop
+from minicode.agent.planner import PLANNING_SYSTEM_PROMPT
 from minicode.agent.planning_models import PlanningConfig
 from minicode.cli.confirm import ConfirmerResult
 from minicode.config.models import AgentConfig, AppConfig, PermissionsConfig, ProviderConfig
@@ -54,6 +63,7 @@ class MockStepProvider(BaseProvider):
     def __init__(self, responses: list[list[StreamChunk]]) -> None:
         self.responses = responses
         self.call_count = 0
+        self.calls: list[dict[str, object]] = []
 
     @property
     def name(self) -> str:
@@ -66,6 +76,14 @@ class MockStepProvider(BaseProvider):
         stream: bool = True,
         max_tokens: int | None = None,
     ) -> AsyncIterator[StreamChunk]:
+        self.calls.append(
+            {
+                "messages": messages,
+                "tools": tools,
+                "stream": stream,
+                "max_tokens": max_tokens,
+            }
+        )
         if self.call_count >= len(self.responses):
             return
         chunks = self.responses[self.call_count]
@@ -145,9 +163,10 @@ class MagicRenderer:
 
     def __init__(self) -> None:
         self.console = MagicConsole()
+        self.info_messages: list[str] = []
 
     def show_info(self, message: str) -> None:
-        pass
+        self.info_messages.append(message)
 
     def show_error(self, message: str) -> None:
         pass
@@ -211,6 +230,231 @@ class RecordingConsole(Console):
     def print(self, *args: Any, **kwargs: Any) -> None:
         self.printed_args.extend(args)
         super().print(*args, **kwargs)
+
+
+def _compaction_report(
+    *,
+    trigger: CompactionTrigger = CompactionTrigger.AUTOMATIC,
+) -> CompactionReport:
+    """构造自动压缩接入测试使用的稳定报告。"""
+    return CompactionReport(
+        trigger=trigger,
+        created_at=datetime.now(UTC),
+        before_tokens=1200,
+        after_tokens=320,
+        before_message_count=6,
+        after_message_count=2,
+        summarized_message_count=4,
+        cleared_tool_result_count=2,
+        unconsumed_tool_result_count=0,
+        retry_used=False,
+        target_reached=True,
+        focus_provided=False,
+    )
+
+
+def _auto_compaction_config() -> CompactionConfig:
+    """使用足够低的阈值，稳定触发规划和主调用预检。"""
+    return CompactionConfig(
+        auto_enabled=True,
+        trigger_ratio=0.001,
+        target_ratio=0.0005,
+        summary_max_tokens=64,
+    )
+
+
+@pytest.mark.parametrize(
+    ("trigger", "label"),
+    [
+        (CompactionTrigger.AUTOMATIC, "自动"),
+        (CompactionTrigger.MANUAL, "手动"),
+    ],
+)
+def test_format_compaction_report_uses_chinese_label(
+    trigger: CompactionTrigger,
+    label: str,
+) -> None:
+    """压缩提示展示触发方式、词元变化和工具结果清理数。"""
+    text = compaction.format_compaction_report(_compaction_report(trigger=trigger))
+
+    assert text == f"上下文{label}压缩：1200 → 320 tokens，清理工具结果 2 条。"
+
+
+@pytest.mark.asyncio
+async def test_prepare_main_call_skips_compactor_below_threshold(
+    tmp_path: Path,
+    app_config: AppConfig,
+) -> None:
+    """占用率低于阈值时不调用压缩器，并使用严格消息构建。"""
+
+    class FailingCompactor:
+        async def compact(self, *args: object, **kwargs: object) -> CompactionResult:
+            raise AssertionError("低于阈值时不应调用压缩器")
+
+    config = app_config.model_copy(deep=True)
+    config.agent.context.max_input_tokens = 100_000
+    loop = AgentLoop(
+        provider=MockStepProvider([]),
+        tool_registry=create_default_registry(),
+        renderer=MagicRenderer(),  # type: ignore[arg-type]
+        config=config,
+        workspace_root=tmp_path,
+    )
+    assert isinstance(loop.context_compactor, compaction.ContextCompactor)
+    loop.context_compactor = FailingCompactor()  # type: ignore[assignment]
+    loop.messages.append(Message(role="user", content="短消息"))
+
+    api_messages = await loop._prepare_main_call(loop.system_prompt, [])
+
+    assert [message.role for message in api_messages] == ["system", "user"]
+    assert loop.last_context_report is not None
+    assert loop.last_compaction_report is None
+    assert loop.compaction_count == 0
+
+
+@pytest.mark.asyncio
+async def test_react_auto_compaction_commits_summary_report_and_count(
+    tmp_path: Path,
+    app_config: AppConfig,
+) -> None:
+    """ReAct 预检提交压缩器结果，并记录报告与累计次数。"""
+
+    class SummaryCompactor:
+        def __init__(self, report: CompactionReport) -> None:
+            self.report = report
+            self.calls: list[dict[str, object]] = []
+
+        async def compact(
+            self,
+            messages: list[Message],
+            system_prompt: str,
+            tools_schema: list[dict],
+            trigger: CompactionTrigger,
+            focus: str | None = None,
+        ) -> CompactionResult:
+            self.calls.append(
+                {
+                    "system_prompt": system_prompt,
+                    "tools_schema": tools_schema,
+                    "trigger": trigger,
+                }
+            )
+            return CompactionResult(
+                messages=[
+                    Message(
+                        role="user",
+                        kind="compact_summary",
+                        content="已压缩的历史摘要",
+                    ),
+                    messages[-1].model_copy(deep=True),
+                ],
+                report=self.report,
+                changed=True,
+            )
+
+    config = app_config.model_copy(deep=True)
+    config.agent.context.compaction = _auto_compaction_config()
+    provider = MockStepProvider(
+        [[
+            StreamChunk(type="text_delta", text="压缩后继续执行"),
+            StreamChunk(type="done", usage=_make_usage()),
+        ]]
+    )
+    renderer = MagicRenderer()
+    report = _compaction_report()
+    compactor = SummaryCompactor(report)
+    loop = AgentLoop(
+        provider=provider,
+        tool_registry=create_default_registry(),
+        renderer=renderer,  # type: ignore[arg-type]
+        config=config,
+        workspace_root=tmp_path,
+    )
+    loop.context_compactor = compactor  # type: ignore[assignment]
+
+    response = await loop.run("继续任务")
+
+    assert response == "压缩后继续执行"
+    assert loop.messages[0].kind == "compact_summary"
+    assert loop.messages[0].content == "已压缩的历史摘要"
+    assert loop.messages[1].content == "继续任务"
+    assert loop.last_compaction_report == report
+    assert loop.compaction_count == 1
+    assert renderer.info_messages[-1] == compaction.format_compaction_report(report)
+    assert compactor.calls[0]["trigger"] == CompactionTrigger.AUTOMATIC
+    provider_messages = provider.calls[0]["messages"]
+    assert isinstance(provider_messages, list)
+    assert provider_messages[1].kind == "compact_summary"
+
+
+@pytest.mark.asyncio
+async def test_planning_preflight_runs_before_planner_without_tools(
+    tmp_path: Path,
+    app_config: AppConfig,
+) -> None:
+    """规划 Provider 调用前先用规划提示词和空工具 schema 执行预检。"""
+    events: list[tuple[str, object, object]] = []
+
+    class OrderedProvider(MockStepProvider):
+        async def chat(
+            self,
+            messages: list[Message],
+            tools: list[dict] | None = None,
+            stream: bool = True,
+            max_tokens: int | None = None,
+        ) -> AsyncIterator[StreamChunk]:
+            events.append(("provider", tools, messages))
+            async for chunk in super().chat(messages, tools, stream, max_tokens):
+                yield chunk
+
+    class OrderedCompactor:
+        async def compact(
+            self,
+            messages: list[Message],
+            system_prompt: str,
+            tools_schema: list[dict],
+            trigger: CompactionTrigger,
+            focus: str | None = None,
+        ) -> CompactionResult:
+            events.append(("compact", tools_schema, system_prompt))
+            return CompactionResult(
+                messages=[message.model_copy(deep=True) for message in messages],
+                changed=False,
+            )
+
+    config = app_config.model_copy(deep=True)
+    config.agent.planning.enabled = True
+    config.agent.context.compaction = _auto_compaction_config()
+    provider = OrderedProvider(
+        [
+            [
+                StreamChunk(
+                    type="text_delta",
+                    text='{"goal":"完成任务","steps":[{"title":"执行"}]}',
+                ),
+                StreamChunk(type="done"),
+            ],
+            [
+                StreamChunk(type="text_delta", text="完成"),
+                StreamChunk(type="done"),
+            ],
+        ]
+    )
+    loop = AgentLoop(
+        provider=provider,
+        tool_registry=create_default_registry(),
+        renderer=MagicRenderer(),  # type: ignore[arg-type]
+        config=config,
+        workspace_root=tmp_path,
+    )
+    loop.context_compactor = OrderedCompactor()  # type: ignore[assignment]
+
+    response = await loop.run("请完成任务")
+
+    assert response == "完成"
+    assert events[0] == ("compact", [], PLANNING_SYSTEM_PROMPT)
+    assert events[1][0] == "provider"
+    assert events[1][1] is None
 
 
 # ─── Test 1: 无工具直接回答 ────────────────────────────────────────
@@ -1382,7 +1626,11 @@ async def test_memory_disabled_remember_filtered_from_schema(
         config=app_config_memory_disabled,
         workspace_root=tmp_path,
     )
-    assert loop is not None
+    tool_names = {
+        tool.get("function", {}).get("name")
+        for tool in loop._get_tools_schema()
+    }
+    assert "remember" not in tool_names
 
 
 @pytest.mark.asyncio

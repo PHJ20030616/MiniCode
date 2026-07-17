@@ -61,6 +61,20 @@ _SUMMARY_FIELDS = {
 }
 
 
+def format_compaction_report(report: CompactionReport) -> str:
+    """把压缩报告格式化为面向用户的中文提示。"""
+    trigger_label = (
+        "自动"
+        if report.trigger == CompactionTrigger.AUTOMATIC
+        else "手动"
+    )
+    return (
+        f"上下文{trigger_label}压缩："
+        f"{report.before_tokens} → {report.after_tokens} tokens，"
+        f"清理工具结果 {report.cleared_tool_result_count} 条。"
+    )
+
+
 def _history_snapshot(messages: list[Message]) -> str:
     """将可总结字段序列化为稳定 JSON，不暴露主模型消费状态。"""
     payload = [
