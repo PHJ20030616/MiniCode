@@ -258,7 +258,7 @@ class TestHandleMessage:
 
     @pytest.mark.parametrize(
         "failure_mode",
-        ["none", "error", "cancel", "save_error", "save_noop"],
+        ["none", "error", "cancel"],
     )
     async def test_failed_first_task_in_empty_session_rolls_back_summary(
         self,
@@ -281,28 +281,12 @@ class TestHandleMessage:
                 raise RuntimeError("任务失败")
             if failure_mode == "cancel":
                 raise asyncio.CancelledError
-            if failure_mode.startswith("save_"):
-                agent_loop.messages.extend(
-                    [
-                        Message(role="user", content=user_input),
-                        Message(role="assistant", content="已完成但保存失败"),
-                    ]
-                )
-                return "已完成但保存失败"
             return None
 
         agent_loop.run = failed_run  # type: ignore[method-assign]
 
         if failure_mode == "cancel":
             with pytest.raises(asyncio.CancelledError):
-                await chat_app._handle_message("失败任务")
-        elif failure_mode == "save_error":
-            manager = chat_app._get_session_manager()
-            with patch.object(manager, "save", side_effect=OSError("磁盘不可写")):
-                await chat_app._handle_message("失败任务")
-        elif failure_mode == "save_noop":
-            manager = chat_app._get_session_manager()
-            with patch.object(manager, "save"):
                 await chat_app._handle_message("失败任务")
         else:
             await chat_app._handle_message("失败任务")
@@ -326,6 +310,54 @@ class TestHandleMessage:
         assert chat_app._initial_user_summary == "成功任务"
         assert chat_app._current_session is not None
         assert chat_app._current_session.metadata["initial_user_summary"] == "成功任务"
+
+    @pytest.mark.parametrize("save_failure", ["error", "noop"])
+    async def test_save_failure_keeps_summary_aligned_with_retained_history(
+        self,
+        chat_app: ChatApp,
+        tmp_path: Path,
+        save_failure: str,
+    ) -> None:
+        """首次消息已保留时，保存失败不应让后续输入替换稳定概要。"""
+        chat_app.workspace_root = tmp_path
+        with patch(
+            "minicode.cli.app.ProviderRegistry.get",
+            return_value=MockProvider("模拟回复"),
+        ):
+            agent_loop = chat_app._get_agent_loop()
+        await chat_app._clear_and_new_session()
+
+        async def successful_run(user_input: str) -> str | None:
+            agent_loop.messages.extend(
+                [
+                    Message(role="user", content=user_input),
+                    Message(role="assistant", content="已完成"),
+                ]
+            )
+            return "已完成"
+
+        agent_loop.run = successful_run  # type: ignore[method-assign]
+        manager = chat_app._get_session_manager()
+        if save_failure == "error":
+            with patch.object(manager, "save", side_effect=OSError("磁盘不可写")):
+                await chat_app._handle_message("第一次任务")
+        else:
+            with patch.object(manager, "save"):
+                await chat_app._handle_message("第一次任务")
+
+        await chat_app._handle_message("第二次任务")
+
+        assert chat_app._current_session is not None
+        loaded = manager.load(chat_app._current_session.id)
+        assert loaded is not None
+        first_user_message = next(
+            message
+            for message in loaded.messages
+            if message.role == "user" and message.kind != "compact_summary"
+        )
+        assert loaded.metadata["initial_user_summary"] == "第一次任务"
+        assert first_user_message.content == "第一次任务"
+        assert loaded.metadata["initial_user_summary"] == first_user_message.content
 
     async def test_successful_first_task_persists_initial_summary(
         self, chat_app: ChatApp, tmp_path: Path

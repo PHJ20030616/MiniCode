@@ -371,11 +371,13 @@ class ChatApp:
         if self._initial_user_summary is None:
             self._initial_user_summary = summarize_user_input(text)
 
-        task_committed = False
+        history_retained = False
         try:
             result = await agent_loop.run(text)
             if result is not None:
-                task_committed = await self._auto_save(agent_loop)
+                # 运行成功后消息已保留；即使落盘失败，概要也必须与内存历史一致。
+                history_retained = True
+                await self._auto_save(agent_loop)
         except ProviderError as e:
             # 回滚本次用户消息
             del agent_loop.messages[history_len:]
@@ -385,7 +387,7 @@ class ChatApp:
             self.renderer.show_error(f"发生未知错误：{e}")
             logger.debug("AgentLoop 处理异常", exc_info=True)
         finally:
-            if not task_committed:
+            if not history_retained:
                 self._initial_user_summary = previous_summary
                 if self._current_session is previous_session:
                     if previous_session is not None:
