@@ -196,6 +196,26 @@ def test_summary_request_uses_fixed_rules_and_default_focus() -> None:
     assert "</history_snapshot>" in request[1].content
 
 
+@pytest.mark.parametrize(
+    "section",
+    [
+        "## 当前任务与最终目标",
+        "## 用户明确要求和限制",
+        "## 已确认的决策",
+        "## 已完成工作与代码变更",
+        "## 关键文件、符号和配置",
+        "## 工具执行得到的有效结论",
+        "## 错误、失败与未验证事项",
+        "## 测试和检查结果",
+        "## 尚未完成的工作",
+    ],
+)
+def test_summary_system_prompt_contains_locked_markdown_section(
+    section: str,
+) -> None:
+    assert section in compaction.SUMMARY_SYSTEM_PROMPT.splitlines()
+
+
 @pytest.mark.parametrize("return_coroutine", [False, True])
 async def test_collect_summary_accepts_both_provider_return_shapes(
     return_coroutine: bool,
