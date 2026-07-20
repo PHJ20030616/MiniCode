@@ -12,22 +12,9 @@ from collections.abc import AsyncIterator
 from typing import Any, cast
 
 from minicode.agent.planning_models import ExecutionPlan, PlanningConfig, PlanStep
+from minicode.prompts.planning import PLANNING_SYSTEM_PROMPT
 from minicode.providers.base import BaseProvider, Message, StreamChunk
 from minicode.utils.exceptions import ProviderError
-
-PLANNING_SYSTEM_PROMPT = (
-    "你是 MiniCode 的任务规划器。"
-    "请先理解用户任务，然后制定一份简洁、可执行的中文计划。"
-    """
-
-输出要求：
-1. 只输出 JSON，不要输出 Markdown，不要包裹代码块。
-2. JSON 结构必须是 {"goal": "...", "steps": [{"title": "...", "description": "..."}]}。
-3. steps 数量不要超过配置要求。
-4. 计划应面向实际执行，包含阅读、修改、验证等必要动作。
-5. 不要调用工具；这里只制定计划，后续执行阶段会使用工具。
-"""
-)
 
 
 def _extract_json_object(text: str) -> str | None:
