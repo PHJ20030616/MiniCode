@@ -1,7 +1,8 @@
 """子代理系统 prompt。"""
 
-from collections.abc import Sequence
+from __future__ import annotations
 
+from collections.abc import Sequence
 
 RESULT_JSON_INSTRUCTION = """最终回答必须只输出一个 JSON 对象，不要包裹 Markdown 代码块：
 {

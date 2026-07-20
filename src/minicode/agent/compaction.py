@@ -19,12 +19,12 @@ from minicode.agent.token_estimator import (
     estimate_message_tokens,
     estimate_messages_tokens,
 )
-from minicode.providers.base import BaseProvider, Message, StreamChunk, ToolMessage
 from minicode.prompts.compaction import (
     SUMMARY_SYSTEM_PROMPT,
     SUMMARY_WRAPPER_PREFIX,
     build_summary_user_prompt,
 )
+from minicode.providers.base import BaseProvider, Message, StreamChunk, ToolMessage
 from minicode.utils.exceptions import ContextCompactionError
 
 _SUMMARY_FIELDS = {

@@ -16,6 +16,8 @@ from minicode.prompts.planning import PLANNING_SYSTEM_PROMPT
 from minicode.providers.base import BaseProvider, Message, StreamChunk
 from minicode.utils.exceptions import ProviderError
 
+__all__ = ["PLANNING_SYSTEM_PROMPT"]
+
 
 def _extract_json_object(text: str) -> str | None:
     """从模型文本中提取第一个 JSON 对象，兼容前后夹带解释文本的输出。"""

@@ -1,6 +1,5 @@
 """MiniCode 的统一 prompt 构建入口。"""
 
-from minicode.prompts.composition import join_sections, render_named_items
 from minicode.prompts.compaction import (
     SUMMARY_SYSTEM_PROMPT,
     SUMMARY_WRAPPER_PREFIX,
@@ -20,6 +19,4 @@ __all__ = [
     "build_main_agent_prompt",
     "build_subagent_prompt",
     "build_summary_user_prompt",
-    "join_sections",
-    "render_named_items",
 ]

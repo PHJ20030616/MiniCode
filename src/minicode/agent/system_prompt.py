@@ -5,8 +5,8 @@
 
 from __future__ import annotations
 
-from minicode.tools.registry import ToolRegistry
 from minicode.prompts import ToolPromptInfo, build_main_agent_prompt
+from minicode.tools.registry import ToolRegistry
 
 
 def build_system_prompt(
