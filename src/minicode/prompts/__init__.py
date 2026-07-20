@@ -1,14 +1,22 @@
 """MiniCode 的统一 prompt 构建入口。"""
 
 from minicode.prompts.composition import join_sections, render_named_items
+from minicode.prompts.compaction import (
+    SUMMARY_SYSTEM_PROMPT,
+    SUMMARY_WRAPPER_PREFIX,
+    build_summary_user_prompt,
+)
 from minicode.prompts.main_agent import build_main_agent_prompt
 from minicode.prompts.models import ToolPromptInfo
 from minicode.prompts.planning import PLANNING_SYSTEM_PROMPT
 
 __all__ = [
     "PLANNING_SYSTEM_PROMPT",
+    "SUMMARY_SYSTEM_PROMPT",
+    "SUMMARY_WRAPPER_PREFIX",
     "ToolPromptInfo",
     "build_main_agent_prompt",
+    "build_summary_user_prompt",
     "join_sections",
     "render_named_items",
 ]
